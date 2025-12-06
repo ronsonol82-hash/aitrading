@@ -1,0 +1,16 @@
+{
+    "sl_min": 1.5,
+    "sl_max": 2.5,
+    "tp_min": 3.5,
+    "tp_max": 6.05,
+    "pullback_min": 0.0,
+    "pullback_max": 0.2,
+    "conf_min": 0.55,
+    "conf_max": 0.75,
+    "trail_act_min": 1.2,
+    "trail_act_max": 2.5,
+    "max_hold_min": 24,
+    "max_hold_max": 72,
+    "train_window": 1071,
+    "test_window": 534
+}
