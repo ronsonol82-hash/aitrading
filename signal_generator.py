@@ -76,13 +76,25 @@ class UniversalSignalFactory:
             
     # -------- ЗАГРУЗКА И ПОДГОТОВКА ДАННЫХ --------
     def load_data(self) -> None:
-        print("🏗 [UNIVERSAL FACTORY] Загрузка рыночных данных...")
+        print("🏗 [UNIVERSAL FACTORY] Загрузка рыночных данных.")
         end = datetime.now()
         # Глубокая история для обучения (≈ 6–7 лет)
         start = end - timedelta(days=2500)
 
-        all_assets = list(set(Config.ASSETS + self.teachers))
-        print(f"   📥 Запрос данных для: {all_assets}")
+        mode = Config.UNIVERSE_MODE
+        if mode == UniverseMode.CRYPTO:
+            # Только крипта
+            all_assets = Config.crypto_symbols()
+        elif mode == UniverseMode.STOCKS:
+            # Только биржа (MOEX / Тинькофф)
+            all_assets = Config.equity_symbols()
+        else:
+            # BOTH — объединяем два списка
+            all_assets = Config.crypto_symbols() + Config.equity_symbols()
+
+        # На всякий случай уберём дубликаты
+        all_assets = list(sorted(set(all_assets)))
+        print(f"   📥 Запрос данных для ({mode.value}): {all_assets}")
 
         leader_map = {sym: Config.get_leader_for_symbol(sym) for sym in all_assets}
 
@@ -224,13 +236,15 @@ class UniversalSignalFactory:
                 return
 
         # 4) Обучение MLEngine на МЕГА-датасете
-        model_path = os.path.join(Config.MODEL_DIR, "UNIVERSAL_BRAIN")
+        mode = Config.UNIVERSE_MODE
+        model_name = f"UNIVERSAL_BRAIN_{mode.value}"
+        model_path = os.path.join(Config.MODEL_DIR, model_name)
         os.makedirs(model_path, exist_ok=True)
 
         engine = MLEngine(model_path, regime_preset=self.preset)
         engine.train(df_train_full, self.feature_cols)
 
-        print("✅ [UNIVERSAL] Глобальная модель обучена и сохранена.")
+        print(f"✅ [UNIVERSAL] Глобальная модель для {mode.value} обучена и сохранена в {model_name}.")
 
         # -------- ИНФЕРЕНС НА ВСЁМ ПОРТФЕЛЕ --------
         print("\n🔮 [UNIVERSAL] Экзамен: генерируем сигналы по всему портфелю...")
@@ -259,12 +273,38 @@ class UniversalSignalFactory:
             # Можно включить лог:
             # print(f"   ✅ {sym}: сигналы сгенерированы ({len(df_res)} строк).")
 
-        # 5) Сохранение в общий файл (тот же, что использует backtester)
-        with open(self.OUTPUT_FILE, "wb") as f:
-            pickle.dump(production_data, f)
+        # 5) Мерджим с существующими сигналами и сохраняем
+        merged_data = self._merge_with_existing_signals(production_data)
 
-        print(f"💾 [UNIVERSAL] Сигналы сохранены в {self.OUTPUT_FILE}")
+        with open(self.OUTPUT_FILE, "wb") as f:
+            pickle.dump(merged_data, f)
+
+        mode = Config.UNIVERSE_MODE
+        print(f"💾 [UNIVERSAL] Сигналы для {mode.value} сохранены/обновлены в {self.OUTPUT_FILE}")
         print("➡️  Дальше можно запускать debug_replayer.py / backtester.py")
+
+    def _merge_with_existing_signals(self, new_signals: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+        """
+        Обновляет production_signals_v1.pkl только по текущему юниверсу.
+        Остальные активы (другая биржа / другие режимы) оставляем как есть.
+        """
+        result: dict[str, pd.DataFrame] = {}
+
+        # 1) Пытаемся прочитать старый файл сигналов
+        try:
+            if os.path.exists(self.OUTPUT_FILE):
+                with open(self.OUTPUT_FILE, "rb") as f:
+                    old = pickle.load(f)
+                if isinstance(old, dict):
+                    result.update(old)
+        except Exception as e:
+            print(f"⚠️ [UNIVERSAL] Не удалось прочитать старый файл сигналов: {e}")
+
+        # 2) Обновляем / добавляем новые сигналы текущего юниверса
+        for sym, df in new_signals.items():
+            result[sym] = df
+
+        return result
 
 class SignalFactory:
     """
@@ -290,7 +330,8 @@ class SignalFactory:
         self.trade_window = trade_window
 
     def load_data(self):
-        print("🏗 [FACTORY] Загрузка свежих рыночных данных...")
+        mode = Config.UNIVERSE_MODE
+        print(f"🏗 [FACTORY] Загрузка свежих рыночных данных для юниверса: {mode.value}.")
         end = datetime.now()
         # Грузим историю с запасом, чтобы индикаторы не поломались
         start = end - timedelta(days=2500) 
@@ -541,6 +582,29 @@ class SignalFactory:
             pickle.dump(final_output, f)
             
         print(f"✅ Успешно сохранено: {self.OUTPUT_FILE}")
+
+    def _merge_with_existing_signals(self, new_signals: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+        """
+        Обновляет production_signals_v1.pkl только по текущему юниверсу.
+        Остальные активы (другая биржа) оставляем как есть.
+        """
+        result: dict[str, pd.DataFrame] = {}
+
+        # 1) Пытаемся прочитать старый файл
+        try:
+            if os.path.exists(self.OUTPUT_FILE):
+                with open(self.OUTPUT_FILE, "rb") as f:
+                    old = pickle.load(f)
+                if isinstance(old, dict):
+                    result.update(old)
+        except Exception as e:
+            print(f"⚠️ [UNIVERSAL] Не удалось прочитать старый файл сигналов: {e}")
+
+        # 2) Обновляем / добавляем новые сигналы текущего юниверса
+        for sym, df in new_signals.items():
+            result[sym] = df
+
+        return result
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Signal Factory & ML Trainer")

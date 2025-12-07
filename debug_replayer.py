@@ -5,6 +5,7 @@ import pickle
 import os
 import sys
 from datetime import datetime, timedelta
+import argparse
 
 # Импортируем наши модули
 from config import Config
@@ -23,7 +24,7 @@ def load_signals():
     with open(path, "rb") as f:
         return pickle.load(f)
 
-def run_debug(oos_start_str=None, enable_plots: bool = False):
+def run_debug(oos_start_str=None, enable_plots: bool = False, asset_class: str = "all"):
     print("🐞 [DEBUG] Запуск реплеера сделок...")
 
     # 1. Загружаем сигналы (чтобы знать диапазон дат)
@@ -40,11 +41,9 @@ def run_debug(oos_start_str=None, enable_plots: bool = False):
     if oos_start_str:
         try:
             oos_start = pd.to_datetime(oos_start_str)
-            print(f"   🚧 OOS start: {oos_start}")
+            print(f"   🚧 OOS-граница: {oos_start}")
         except Exception:
-            print(f"   ⚠️ Не удалось распарсить oos_start='{oos_start_str}', игнорируем.")
-            oos_start = None
-
+            print(f"⚠️ Не получилось распарсить oos_start={oos_start_str}")
     # ⬇️ Загрузка рынка — ВСЕГДА, вне if
     print("   📥 Загрузка рыночных данных...")
 
@@ -90,8 +89,13 @@ def run_debug(oos_start_str=None, enable_plots: bool = False):
     
     results = backtester.run_simulation()
     
-    trades = results['closed_trades']
-    equity = results['equity']
+    # После бэктеста
+    trades = results["closed_trades"]
+    equity = results["equity"]
+
+    # --- NEW: фильтрация по классу актива ---
+    trades = filter_trades_by_asset_class(trades, asset_class)
+    print(f"🔎 [DEBUG] Asset class filter: {asset_class}, trades after filter: {len(trades)}")
     
     # === [CRITICAL UPDATE] СИНХРОНИЗАЦИЯ БАЛАНСА ===
     # Добавляем в таблицу сделок реальный баланс на момент закрытия.
@@ -196,30 +200,66 @@ def run_debug(oos_start_str=None, enable_plots: bool = False):
                 oos_start=oos_start,
             )
 
+def classify_symbol(symbol: str) -> str:
+    """
+    Грубая эвристика:
+    - если тикер заканчивается на USDT/USDC/BTC/ETH → считаем криптой;
+    - иначе → считаем стоком (MOEX/FX/прочее).
+    """
+    if not isinstance(symbol, str):
+        return "stocks"
+    s = symbol.upper()
+    if s.endswith(("USDT", "USDC", "BTC", "ETH")):
+        return "crypto"
+    return "stocks"
+
+
+def filter_trades_by_asset_class(trades_df: pd.DataFrame, asset_class: str) -> pd.DataFrame:
+    """
+    trades_df: pandas.DataFrame с колонкой 'symbol'
+    asset_class: 'all' | 'crypto' | 'stocks'
+    """
+    if asset_class == "all":
+        return trades_df
+
+    if "symbol" not in trades_df.columns:
+        # ничего не знаем → не фильтруем, но можно вывести warning
+        print("⚠️ No 'symbol' column in trades data, cannot filter by asset class.")
+        return trades_df
+
+    mask = trades_df["symbol"].apply(classify_symbol)
+    return trades_df[mask == asset_class].copy()
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Debug trade replayer")
+    parser = argparse.ArgumentParser(description="Debug Replayer")
     parser.add_argument(
         "--oos_start",
         type=str,
         default=None,
-        help=(
-            "Дата начала OOS (YYYY-MM-DD или YYYY-MM-DD HH:MM:SS) "
-            "для вертикальной линии на графиках."
-        ),
+        help="Дата (YYYY-MM-DD или YYYY-MM-DD HH:MM:SS), с которой считать OOS-период",
     )
     parser.add_argument(
         "--plot",
         action="store_true",
-        help="Если указан, строим графики сделок через TradeVisualizer.",
+        help="Рисовать графики эквити/просадки и сделок.",
+    )
+    # --- NEW: выбор класса актива ---
+    parser.add_argument(
+        "--asset_class",
+        type=str,
+        default="all",
+        choices=["all", "crypto", "stocks"],
+        help="Фильтр сделок по классу актива: all / crypto / stocks",
     )
 
     args = parser.parse_args()
 
     try:
-        run_debug(oos_start_str=args.oos_start, enable_plots=args.plot)
+        run_debug(
+            oos_start_str=args.oos_start,
+            enable_plots=args.plot,
+            asset_class=args.asset_class,
+        )
     except KeyboardInterrupt:
         print("\n🛑 Прервано пользователем.")
     except Exception as e:

@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
     QWidget, QLabel, QComboBox, QGroupBox, QTabWidget, QPushButton,
     QTextEdit, QSplitter, QDoubleSpinBox, QGridLayout, QFrame, QSlider,
-    QTableWidget, QHeaderView, QTableWidgetItem, QRadioButton
+    QTableWidget, QHeaderView, QTableWidgetItem, QRadioButton, QCheckBox
 )
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QObject, QTimer
 from PyQt5.QtGui import QPainter, QPicture, QColor, QFont
@@ -325,6 +325,12 @@ class FundManagerWindow(QMainWindow):
         # Текущий выбранный юниверс (крипта/биржа/оба)
         self.current_universe_mode = Config.UNIVERSE_MODE
 
+        # --- NEW: профиль оптимизатора (AUTO / CRYPTO / STOCKS / BOTH) ---
+        env_profile = os.getenv("OPTIMIZER_PROFILE", "auto").lower()
+        if env_profile not in ("crypto", "stocks", "both", "auto"):
+            env_profile = "auto"
+        self.optimizer_profile_mode = env_profile  # храним в окне
+
         # 1) Строим UI (создаётся self.console)
         self.setup_ui()
 
@@ -437,6 +443,52 @@ class FundManagerWindow(QMainWindow):
         
         settings_layout.addLayout(grid)
         
+        # --- NEW: Strategy Profile indicator ---
+        try:
+            mode = getattr(self, "current_universe_mode", Config.UNIVERSE_MODE)
+            profile_key = getattr(mode, "value", "both")
+        except Exception:
+            profile_key = "both"
+
+        effective_profile = self._get_effective_optimizer_profile()
+        self.lbl_optimizer_profile = QLabel(f"Optimizer profile: {effective_profile.upper()}")
+        self.lbl_optimizer_profile.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+        settings_layout.addWidget(self.lbl_optimizer_profile)
+
+
+        # --- NEW: COMBOBOX ДЛЯ ВЫБОРА ПРОФИЛЯ ---
+        self.cbo_optimizer_profile = QComboBox()
+        self.cbo_optimizer_profile.addItems(["AUTO", "CRYPTO", "STOCKS", "BOTH"])
+
+        # Инициализация по текущему состоянию
+        current_profile = self.optimizer_profile_mode.upper()
+        if current_profile not in ("AUTO", "CRYPTO", "STOCKS", "BOTH"):
+            current_profile = "AUTO"
+        self.cbo_optimizer_profile.setCurrentText(current_profile)
+
+        self.cbo_optimizer_profile.currentTextChanged.connect(
+            self.on_optimizer_profile_changed
+        )
+        settings_layout.addWidget(self.cbo_optimizer_profile)
+
+        # --- NEW: Telegram HTF feature toggles ---
+        # Эти флаги прокидываются через ENV в оптимизатор / генератор / дебаг реплеер.
+        self.chk_tg_crypto = QCheckBox("Telegram HTF → Crypto")
+        self.chk_tg_stocks = QCheckBox("Telegram HTF → Stocks")
+
+        # Инициализация по Config/ENV (по умолчанию включено, если переменных нет)
+        use_tg_crypto = getattr(
+            Config, "USE_TG_CRYPTO", os.getenv("USE_TG_CRYPTO", "1") == "1"
+        )
+        use_tg_stocks = getattr(
+            Config, "USE_TG_STOCKS", os.getenv("USE_TG_STOCKS", "1") == "1"
+        )
+        self.chk_tg_crypto.setChecked(bool(use_tg_crypto))
+        self.chk_tg_stocks.setChecked(bool(use_tg_stocks))
+
+        settings_layout.addWidget(self.chk_tg_crypto)
+        settings_layout.addWidget(self.chk_tg_stocks)
+
         # --- NEW: WFO SLIDERS (TRAIN / TRADE WINDOWS) ---
         self.wfo_widget = WFOSettingsWidget()
         settings_layout.addWidget(self.wfo_widget)
@@ -613,30 +665,62 @@ class FundManagerWindow(QMainWindow):
         btn_gen.clicked.connect(self.run_walk_generator)
         
         # 1U. УНИВЕРСАЛЬНЫЙ МОЗГ
-        btn_gen_universal = QPushButton("1U. UNIVERSAL SIGNAL GENERATOR (BTC+ETH+ETHBTC)")
+        btn_gen_universal = QPushButton("1U. UNIVERSAL BRAIN (Cross-Asset WF)")
         btn_gen_universal.setObjectName("ActionBtn")
         btn_gen_universal.setToolTip(
-            "Обучить единую модель на BTCUSDT, ETHUSDT и ETHBTC\n"
-            "и сгенерировать сигналы для всего портфеля."
+            "Обучить единый Universal Brain и сгенерировать сигналы по всему портфелю."
         )
         btn_gen_universal.clicked.connect(self.run_universal_generator)
+
+        # --- НОВОЕ: отдельные кнопки для крипты и стоков ---
+        btn_gen_universal_crypto = QPushButton("1U-C. Train Crypto Brain")
+        btn_gen_universal_crypto.setToolTip(
+            "Переключиться на крипто-юниверс и обучить Universal Brain только на крипте."
+        )
+        btn_gen_universal_crypto.clicked.connect(self.run_universal_crypto_brain)
+
+        btn_gen_universal_stocks = QPushButton("1U-S. Train Stocks Brain")
+        btn_gen_universal_stocks.setToolTip(
+            "Переключиться на биржевой юниверс и обучить Universal Brain только на акциях/валютах."
+        )
+        btn_gen_universal_stocks.clicked.connect(self.run_universal_stocks_brain)
         
         # 2. Генетический оптимизатор
         btn_opt = QPushButton("2. GENETIC OPTIMIZER (Sniper Mode)")
         btn_opt.setObjectName("ActionBtn")  # Blue Highlight
         btn_opt.clicked.connect(self.run_optimizer_with_save)
         
-        # 3. Дебаг реплеер
+        # 3. Дебаг реплеер (все сделки)
         btn_replay = QPushButton("3. DEBUG REPLAYER (Trace Report)")
         btn_replay.setObjectName("ActionBtn")
         btn_replay.setStyleSheet("border-color: #ffd700; color: #ffd700;")
         btn_replay.clicked.connect(lambda: self.run_script("debug_replayer.py", []))
+
+        # --- NEW: дебаг только по крипте ---
+        btn_replay_crypto = QPushButton("3C. DEBUG REPLAYER – CRYPTO ONLY")
+        btn_replay_crypto.setObjectName("ActionBtn")
+        btn_replay_crypto.setToolTip("Реплейер только по криптовым инструментам (asset_class=crypto).")
+        btn_replay_crypto.clicked.connect(
+            lambda: self.run_script("debug_replayer.py", ["--asset_class", "crypto"])
+        )
+
+        # --- NEW: дебаг только по стокам ---
+        btn_replay_stocks = QPushButton("3S. DEBUG REPLAYER – STOCKS ONLY")
+        btn_replay_stocks.setObjectName("ActionBtn")
+        btn_replay_stocks.setToolTip("Реплейер только по биржевым инструментам (asset_class=stocks).")
+        btn_replay_stocks.clicked.connect(
+            lambda: self.run_script("debug_replayer.py", ["--asset_class", "stocks"])
+        )
         
         # Добавляем в правильном порядке
         prod_layout.addWidget(btn_gen)
         prod_layout.addWidget(btn_gen_universal)
+        prod_layout.addWidget(btn_gen_universal_crypto)
+        prod_layout.addWidget(btn_gen_universal_stocks)
         prod_layout.addWidget(btn_opt)
         prod_layout.addWidget(btn_replay)
+        prod_layout.addWidget(btn_replay_crypto)
+        prod_layout.addWidget(btn_replay_stocks)
         
         exec_layout_main.addWidget(diag_group)
         exec_layout_main.addWidget(mode_group)
@@ -719,6 +803,41 @@ class FundManagerWindow(QMainWindow):
 
         # Перезаполняем список инструментов в WAR ROOM
         self.refresh_asset_combo()
+
+        # Подгружаем оптимизатор-профиль для выбранного юниверса
+        if hasattr(self, "spin_sl_min"):
+            self.load_optimizer_settings()
+
+    def _get_effective_optimizer_profile(self) -> str:
+        """
+        Возвращает реально используемый профиль:
+        - если optimizer_profile_mode != auto → берём его прямо;
+        - если auto → берём из current_universe_mode / Config.UNIVERSE_MODE.
+        """
+        if self.optimizer_profile_mode in ("crypto", "stocks", "both"):
+            return self.optimizer_profile_mode
+
+        # auto → профиль от текущего юниверса
+        try:
+            mode_obj = getattr(self, "current_universe_mode", Config.UNIVERSE_MODE)
+            return getattr(mode_obj, "value", "both")
+        except Exception:
+            return "both"
+
+    def on_optimizer_profile_changed(self, text: str):
+        """
+        Вызывается при смене профиля в комбобоксе.
+        Обновляем env и подпись.
+        """
+        mode = text.lower()
+        if mode not in ("auto", "crypto", "stocks", "both"):
+            mode = "auto"
+
+        self.optimizer_profile_mode = mode
+        os.environ["OPTIMIZER_PROFILE"] = mode  # увидят optimizer.py / signal_generator.py
+
+        effective_profile = self._get_effective_optimizer_profile()
+        self.lbl_optimizer_profile.setText(f"Optimizer profile: {effective_profile.upper()}")
 
     # ------------------------------------------
     # TAB 2: WAR ROOM
@@ -1119,52 +1238,133 @@ class FundManagerWindow(QMainWindow):
     # LOGIC
     # ==========================================
     def save_optimizer_settings(self):
-        settings = {
+        # 1) Собираем настройки текущего профиля
+        profile = {
             "sl_min": self.spin_sl_min.value(), "sl_max": self.spin_sl_max.value(),
             "tp_min": self.spin_tp_min.value(), "tp_max": self.spin_tp_max.value(),
             "pullback_min": self.spin_pull_min.value(), "pullback_max": self.spin_pull_max.value(),
             "conf_min": self.spin_conf_min.value(), "conf_max": self.spin_conf_max.value(),
             "trail_act_min": 1.2, "trail_act_max": 2.5,
-            "max_hold_min": 24, "max_hold_max": 72
+            "max_hold_min": 24, "max_hold_max": 72,
         }
-        # NEW: сохраняем окна WFO
+
+        # Окна WALK-FORWARD
         if hasattr(self, "wfo_widget"):
             train_bars, test_bars = self.wfo_widget.get_values()
-            settings["train_window"] = int(train_bars)
-            settings["test_window"] = int(test_bars)
-        try:
-            with open("optimizer_settings.json", "w") as f:
-                json.dump(settings, f, indent=4)
-            print("✅ Configuration saved to optimizer_settings.json")
-        except Exception as e:
-            print(f"❌ Save Error: {e}")
+            profile["train_window"] = int(train_bars)
+            profile["test_window"] = int(test_bars)
 
-    def load_optimizer_settings(self):
+        # 2) Определяем ключ профиля по текущему юниверсу
+        try:
+            mode = getattr(self, "current_universe_mode", Config.UNIVERSE_MODE)
+            profile_key = getattr(mode, "value", "both")
+        except Exception:
+            profile_key = "both"
+
+        # 3) Читаем существующий файл (если есть)
+        data = {}
         if os.path.exists("optimizer_settings.json"):
             try:
                 with open("optimizer_settings.json", "r") as f:
-                    s = json.load(f)
-                    self.spin_sl_min.setValue(s.get("sl_min", 1.5))
-                    self.spin_sl_max.setValue(s.get("sl_max", 2.5))
-                    self.spin_tp_min.setValue(s.get("tp_min", 3.0))
-                    self.spin_tp_max.setValue(s.get("tp_max", 6.0))
-                    self.spin_pull_min.setValue(s.get("pullback_min", 0.0))
-                    self.spin_pull_max.setValue(s.get("pullback_max", 0.15))
-                    self.spin_conf_min.setValue(s.get("conf_min", 0.65))
-                    self.spin_conf_max.setValue(s.get("conf_max", 0.85))
-                    
-                    # NEW: восстановление слайдеров WFO
-                    if hasattr(self, "wfo_widget"):
-                        default_train, default_test = self.wfo_widget.get_values()
-                        self.wfo_widget.slider_train.setValue(
-                            int(s.get("train_window", default_train))
-                        )
-                        self.wfo_widget.slider_test.setValue(
-                            int(s.get("test_window", default_test))
-                        )
-                        self.wfo_widget.update_labels()
-            except:
+                    data = json.load(f)
+                    if not isinstance(data, dict):
+                        data = {}
+            except Exception:
+                data = {}
+
+        # 4) Обратная совместимость: старый формат (плоский словарь)
+        if "sl_min" in data or "tp_min" in data:
+            # Заворачиваем старый формат в профиль 'both'
+            data = {"both": data}
+
+        # 5) Обновляем профиль текущего юниверса
+        if profile_key not in data or not isinstance(data[profile_key], dict):
+            data[profile_key] = {}
+        data[profile_key].update(profile)
+
+        # 6) Сохраняем override профиля оптимизатора (чтобы не потерялся между сессиями)
+        data["optimizer_profile_override"] = self.optimizer_profile_mode
+
+        try:
+            with open("optimizer_settings.json", "w") as f:
+                json.dump(data, f, indent=4)
+            print(f"✅ Configuration saved for profile '{profile_key}' in optimizer_settings.json")
+        except Exception as e:
+            print(f"❌ Save Error: {e}")
+
+        # 7) Обновляем ENV для Telegram HTF...
+        if hasattr(self, "chk_tg_crypto"):
+            os.environ["USE_TG_CRYPTO"] = "1" if self.chk_tg_crypto.isChecked() else "0"
+        if hasattr(self, "chk_tg_stocks"):
+            os.environ["USE_TG_STOCKS"] = "1" if self.chk_tg_stocks.isChecked() else "0"
+            
+
+    def load_optimizer_settings(self):
+        if not os.path.exists("optimizer_settings.json"):
+            # Если файла нет — хотя бы подпись профиля обновим по текущему effective-профилю
+            try:
+                if hasattr(self, "lbl_optimizer_profile"):
+                    effective = self._get_effective_optimizer_profile()
+                    self.lbl_optimizer_profile.setText(f"Optimizer profile: {effective.upper()}")
+            except Exception:
                 pass
+            return
+
+        try:
+            with open("optimizer_settings.json", "r") as f:
+                data = json.load(f)
+        except Exception:
+            return
+
+        # --- NEW: восстановление override-профиля оптимизатора ---
+        if isinstance(data, dict):
+            override = data.get("optimizer_profile_override")
+            if override in ("crypto", "stocks", "both", "auto"):
+                # сохраняем режим в окне
+                self.optimizer_profile_mode = override
+                # и сразу прокидываем в ENV, чтобы optimizer.py его увидел
+                os.environ["OPTIMIZER_PROFILE"] = override
+                # синхронизируем комбобокс, если он уже создан
+                if hasattr(self, "cbo_optimizer_profile"):
+                    self.cbo_optimizer_profile.setCurrentText(override.upper())
+
+        # Определяем текущий юниверс (для выбора профиля настроек из файла)
+        try:
+            mode = getattr(self, "current_universe_mode", Config.UNIVERSE_MODE)
+            profile_key = getattr(mode, "value", "both")
+        except Exception:
+            profile_key = "both"
+
+        # Старый формат (плоский словарь)
+        if isinstance(data, dict) and ("sl_min" in data or "tp_min" in data):
+            s = data
+        else:
+            # Новый формат: словарь профилей
+            if not isinstance(data, dict):
+                return
+            s = data.get(profile_key) or data.get("both") or {}
+
+        # Обновляем спины
+        self.spin_sl_min.setValue(s.get("sl_min", 1.5))
+        self.spin_sl_max.setValue(s.get("sl_max", 2.5))
+        self.spin_tp_min.setValue(s.get("tp_min", 3.0))
+        self.spin_tp_max.setValue(s.get("tp_max", 6.0))
+        self.spin_pull_min.setValue(s.get("pullback_min", 0.0))
+        self.spin_pull_max.setValue(s.get("pullback_max", 0.15))
+        self.spin_conf_min.setValue(s.get("conf_min", 0.65))
+        self.spin_conf_max.setValue(s.get("conf_max", 0.85))
+
+        # Восстанавливаем слайдеры WFO
+        if hasattr(self, "wfo_widget"):
+            default_train, default_test = self.wfo_widget.get_values()
+            self.wfo_widget.slider_train.setValue(int(s.get("train_window", default_train)))
+            self.wfo_widget.slider_test.setValue(int(s.get("test_window", default_test)))
+            self.wfo_widget.update_labels()
+
+        # Обновляем подпись активного профиля (с учётом режима AUTO)
+        if hasattr(self, "lbl_optimizer_profile"):
+            effective = self._get_effective_optimizer_profile()
+            self.lbl_optimizer_profile.setText(f"Optimizer profile: {effective.upper()}")
 
     def run_optimizer_with_save(self):
         self.save_optimizer_settings()
@@ -1459,10 +1659,32 @@ class FundManagerWindow(QMainWindow):
         self.run_script("signal_generator.py", args)
 
     def run_universal_generator(self):
-        # Включаем Cross-Asset WF по умолчанию для универсального мозга
+        # Явно указываем режим через флаг --mode
         args = ["--mode", "universal", "--preset", "grinder", "--cross_asset_wf"]
         args += self._build_wfo_cli()
         self.run_script("signal_generator.py", args)
+
+    # --- НОВОЕ: кнопки Train Crypto / Train Stocks Brain ---
+
+    def run_universal_crypto_brain(self):
+        """
+        Быстрый хелпер:
+        - переключает юниверс на CRYPTO через радиокнопку,
+        - запускает универсальный мозг.
+        """
+        if hasattr(self, "radio_universe_crypto"):
+            self.radio_universe_crypto.setChecked(True)
+        self.run_universal_generator()
+
+    def run_universal_stocks_brain(self):
+        """
+        Быстрый хелпер:
+        - переключает юниверс на STOCKS через радиокнопку,
+        - запускает универсальный мозг.
+        """
+        if hasattr(self, "radio_universe_stocks"):
+            self.radio_universe_stocks.setChecked(True)
+        self.run_universal_generator()
 
     def run_script(self, script_name, args):
         self.console.clear()

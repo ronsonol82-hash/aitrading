@@ -11,15 +11,22 @@ from transformers import pipeline
 import torch
 import redis
 
-# Импортируем конфиг для настроек Redis
+# Импортируем конфиг для настроек Redis / юниверсов
 try:
-    from config import Config
+    from config import Config, UniverseMode
 except ImportError:
     # Заглушка, если запускаем скрипт отдельно от проекта
+    class UniverseMode:
+        CRYPTO = "crypto"
+        STOCKS = "stocks"
+        BOTH = "both"
+
     class Config:
         USE_REDIS = True
         REDIS_HOST = 'localhost'
         REDIS_PORT = 6379
+        # Минимальный порог для сигнала, чтобы код ниже не падал
+        MIN_EDGE = 0.01
 
 # --- КЛЮЧИ ---
 # Берем из конфига, если он загрузился, или из переменных окружения
@@ -29,9 +36,57 @@ API_HASH = getattr(Config, 'TG_API_HASH', os.getenv('TELEGRAM_API_HASH'))
 if not API_ID or not API_HASH:
     raise ValueError("❌ Не найдены API_ID или API_HASH! Проверь .env или config.py")
 
-CHANNELS = [
-    'tree_of_alpha', 'unusual_whales', 'WatcherGuru', 'Tier10k', 'WalterBloomberg',
-    'Cointelegraph', 'CryptoTownEU'
+# --- ВЫБОР КАНАЛОВ ПО ЮНИВЕРСУ ---
+
+def resolve_channels():
+    # Дефолтный крипто-набор (как был раньше)
+    default_crypto = [
+        'tree_of_alpha', 'unusual_whales', 'WatcherGuru',
+        'Tier10k', 'WalterBloomberg', 'Cointelegraph', 'CryptoTownEU'
+    ]
+
+    crypto_channels = getattr(Config, "TG_CRYPTO_CHANNELS", default_crypto)
+    stocks_channels = getattr(Config, "TG_STOCK_CHANNELS", [])
+
+    # Пытаемся взять режим из конфига
+    mode = getattr(Config, "UNIVERSE_MODE", None)
+    if mode is not None and hasattr(mode, "value"):
+        mode_value = mode.value
+    else:
+        # Фоллбэк на ENV, если что-то не так
+        mode_value = os.getenv("UNIVERSE_MODE", "crypto").lower()
+
+    if mode_value == "crypto":
+        selected = crypto_channels
+    elif mode_value == "stocks":
+        selected = stocks_channels or crypto_channels   # если не задано — хоть крипта
+    else:
+        # BOTH: объединяем без дубликатов
+        selected = list(dict.fromkeys(crypto_channels + stocks_channels))
+
+    print(f"🛰 Telegram mode = {mode_value}, channels: {selected}")
+    return selected
+
+CHANNELS = resolve_channels()
+
+# Крипта: англоязычные крипто-каналы (как было в скраперe)
+TG_CRYPTO_CHANNELS = [
+    'tree_of_alpha',
+    'unusual_whales',
+    'WatcherGuru',
+    'Tier10k',
+    'WalterBloomberg',
+    'Cointelegraph',
+    'CryptoTownEU',
+]
+
+# Акции / МОЕХ: сюда можно подставить свои реальные русские/англ. источники
+TG_STOCK_CHANNELS = [
+    # примеры-заглушки, поменяй на свои:
+    'smartlab_ru',
+    'moex_official',
+    'finam_ru',
+    'rbc_invest',
 ]
 
 OUTPUT_FILE = 'data_cache/news_sentiment.csv'
@@ -199,8 +254,24 @@ async def main():
     cutoff_date = datetime.now() - timedelta(days=DAYS_BACK)
     cutoff_date = cutoff_date.replace(tzinfo=None)
     
+    # Учитываем флаги Config: если всё выключено — просто выходим
+    use_crypto = getattr(Config, "USE_TG_CRYPTO", True)
+    use_stocks = getattr(Config, "USE_TG_STOCKS", True)
+    mode = getattr(Config, "UNIVERSE_MODE", None)
+
+    if mode == UniverseMode.CRYPTO and not use_crypto:
+        print("⚠️ Telegram HTF for CRYPTO выключен (USE_TG_CRYPTO=0). Скраппер не запускается.")
+        return
+    if mode == UniverseMode.STOCKS and not use_stocks:
+        print("⚠️ Telegram HTF for STOCKS выключен (USE_TG_STOCKS=0). Скраппер не запускается.")
+        return
+    if mode == UniverseMode.BOTH and not (use_crypto or use_stocks):
+        print("⚠️ Telegram HTF полностью выключен. Скраппер не запускается.")
+        return
+
     all_news = []
-    for channel in CHANNELS:
+    channels = resolve_channels()
+    for channel in channels:
         news = await scrape_channel(client, channel, cutoff_date)
         print(f"    ✅ {channel}: {len(news)} записей.")
         all_news.extend(news)

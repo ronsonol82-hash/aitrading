@@ -7,7 +7,7 @@ import numpy as np
 import redis
 import json
 from datetime import datetime, timedelta
-from config import Config
+from config import Config, UniverseMode
 from brokers import get_broker
 from indicators import FeatureEngineer
 
@@ -188,23 +188,104 @@ class DataLoader:
 
         # --- TINKOFF (акции МОЕХ, тоже только явно маршрутизированные) ---
         if uname == "tinkoff":
-            print(f"📥 [TINKOFF] Загрузка {symbol}...")
-            try:    
+            print(f"📥 [TINKOFF] Загрузка {symbol} (interval={interval})...")
+            try:
                 broker = get_broker("tinkoff")
-                return broker.get_historical_klines(
+
+                # 1) Всегда просим у Tinkoff «сырые» 1h-свечи
+                raw_interval = "1h"
+                df = broker.get_historical_klines(
                     symbol=symbol,
-                    interval=interval,
+                    interval=raw_interval,
                     start=start_date,
                     end=end_date,
                 )
+
+                if df is None or df.empty:
+                    print(f"⚠️ [TINKOFF] Пустые данные для {symbol}")
+                    return df
+
+                # Убедимся, что индекс — datetime
+                if not isinstance(df.index, pd.DatetimeIndex):
+                    if "datetime" in df.columns:
+                        df["datetime"] = pd.to_datetime(df["datetime"])
+                        df = df.set_index("datetime")
+                    else:
+                        df.index = pd.to_datetime(df.index)
+
+                df = df.sort_index()
+
+                # 2) Если стратегия просит 4h — агрегируем 1H → 4H
+                if str(interval).lower() == "4h":
+                    agg = {}
+
+                    # Базовые OHLCV
+                    if "open" in df.columns:
+                        agg["open"] = "first"
+                    if "high" in df.columns:
+                        agg["high"] = "max"
+                    if "low" in df.columns:
+                        agg["low"] = "min"
+                    if "close" in df.columns:
+                        agg["close"] = "last"
+                    if "volume" in df.columns:
+                        agg["volume"] = "sum"
+
+                    # Если вдруг есть тиковые/доп.колонки — пытаемся агрегировать разумно
+                    for col in df.columns:
+                        if col in agg:
+                            continue
+                        # Объёмоподобные — суммируем
+                        if any(x in col for x in ["volume", "vol", "taker"]):
+                            agg[col] = "sum"
+                        else:
+                            # Остальное — среднее (ставки, индексы и т.п.)
+                            agg[col] = "mean"
+
+                    df_4h = df.resample("4H").agg(agg)
+
+                    # Убираем полностью пустые бары
+                    df_4h = df_4h.dropna(how="all")
+
+                    if "close" in df_4h.columns:
+                        df_4h = df_4h.dropna(subset=["close"])
+
+                    df_4h.index.name = "datetime"
+                    print(f"✅ [TINKOFF] Агрегация 1H → 4H завершена: {len(df_4h)} баров.")
+                    return df_4h
+
+                # 3) Если запрошен не 4h — отдаём как есть (1h/1d и т.п.)
+                return df
+
             except Exception as e:
                 print(f"⚠️ [DATA] Tinkoff failed for {symbol}, fallback to Binance: {e}")
                 return DataLoader.get_binance_data(symbol, start_date, end_date, interval)
-
+            
         # --- ВСЁ ОСТАЛЬНОЕ → Binance как универсальный поставщик истории ---
         return DataLoader.get_binance_data(symbol, start_date, end_date, interval)
 
     def load_news_sentiment(self):
+        # --- 0. Проверяем, не выключен ли Telegram-HTF флагами Config / ENV ---
+        try:
+            mode = getattr(Config, "UNIVERSE_MODE", None)
+        except Exception:
+            mode = None
+
+        use_crypto = getattr(
+            Config, "USE_TG_CRYPTO", os.getenv("USE_TG_CRYPTO", "1") == "1"
+        )
+        use_stocks = getattr(
+            Config, "USE_TG_STOCKS", os.getenv("USE_TG_STOCKS", "1") == "1"
+        )
+
+        if mode == UniverseMode.CRYPTO and not use_crypto:
+            return None
+        if mode == UniverseMode.STOCKS and not use_stocks:
+            return None
+        if mode == UniverseMode.BOTH and not (use_crypto or use_stocks):
+            return None
+
+        # --- 1. Redis-кэш ---
         if self.redis_client:
             try:
                 cached = self.redis_client.lrange("news_sentiment", 0, -1)
@@ -216,37 +297,112 @@ class DataLoader:
                     try:
                         # Ресемплим под конфиг (1h или 15m)
                         return df.resample(Config.TIMEFRAME_LTF)['sentiment'].mean().to_frame()
-                    except: return None
-            except: pass
+                    except:
+                        return None
+            except:
+                pass
 
-        if not os.path.exists(DataLoader.NEWS_FILE): return None
+        # --- 2. Файловый кэш ---
+        if not os.path.exists(DataLoader.NEWS_FILE):
+            return None
         try:
-            df_news = pd.read_csv(DataLoader.NEWS_FILE, index_col='datetime', parse_dates=True)
+            df_news = pd.read_csv(
+                DataLoader.NEWS_FILE, index_col='datetime', parse_dates=True
+            )
             df_news['sentiment_ema'] = df_news['sentiment'].ewm(span=12).mean()
             return df_news[['sentiment', 'sentiment_ema']]
-        except: return None
+        except:
+            return None
+
+    # --- НОВОЕ: универсальный фетчер с файловым кэшем ---
+    def _fetch_and_cache(self, symbol, start_date, end_date, interval):
+        """
+        Загружает свечи для symbol с кэшем в data_cache.
+
+        1) Пытается прочитать локальный .pkl из CACHE_DIR.
+        2) Если кэша нет или он битый — тянет через get_exchange_data.
+        3) Если данные успешно получены и непустые — сохраняет в .pkl.
+        """
+        self._ensure_cache_dir()
+
+        # Простейший ключ кэша: тикер + таймфрейм + даты
+        start_str = start_date.strftime("%Y%m%d")
+        end_str = end_date.strftime("%Y%m%d")
+        fname = os.path.join(
+            DataLoader.CACHE_DIR,
+            f"{symbol}_{interval}_{start_str}_{end_str}.pkl"
+        )
+
+        # 1) Пробуем загрузить из файла
+        if os.path.exists(fname):
+            try:
+                df_cached = pd.read_pickle(fname)
+                # На всякий случай проверим, что это вообще DataFrame
+                if isinstance(df_cached, pd.DataFrame) and not df_cached.empty:
+                    print(f"   ♻️ [CACHE] {symbol} ({interval}) загружен из кэша.")
+                    return df_cached
+            except Exception as e:
+                print(f"   ⚠️ [CACHE] Ошибка чтения кэша {fname}: {e}")
+
+        # 2) Кэша нет или он битый — тянем с биржи
+        df = DataLoader.get_exchange_data(symbol, start_date, end_date, interval)
+        if df is None:
+            df = pd.DataFrame()
+
+        # 3) Сохраняем в кэш, если есть что сохранять
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            try:
+                df.to_pickle(fname)
+                print(f"   💾 [CACHE] {symbol} ({interval}) сохранён в {fname}.")
+            except Exception as e:
+                print(f"   ⚠️ [CACHE] Не удалось сохранить {fname}: {e}")
+
+        return df
 
     @staticmethod
-    def _fetch_and_cache(symbol, start_date, end_date, interval):
-        DataLoader._ensure_cache_dir()
-        safe_symbol = symbol.replace("-", "").replace("/", "")
-        
-        # v7 - версия кэша для 1H/4H
-        filename = f"{DataLoader.CACHE_DIR}/{safe_symbol}_{interval}_v7_WAR.csv"
-        
-        if os.path.exists(filename):
+    def get_exchange_data(symbol, start_date, end_date, interval):
+        """
+        Унифицированная точка входа для загрузки свечей с биржи.
+
+        Логика:
+        - смотрим Config.ASSET_ROUTING → определяем брокера;
+        - если брокер = bitget/tinkoff, пробуем его,
+        при ошибке — fallback на Binance.
+        """
+        broker_name = Config.ASSET_ROUTING.get(symbol, Config.DEFAULT_BROKER)
+        uname = str(broker_name).lower() if broker_name else None
+
+        # --- BITGET (крипта) ---
+        if uname == "bitget":
             try:
-                df = pd.read_csv(filename, index_col='datetime', parse_dates=True)
-                if len(df) > 100:
-                    mask = (df.index >= start_date) & (df.index <= end_date)
-                    if len(df.loc[mask]) > 0: return df.loc[mask]
-            except: pass 
-        
-        # 👉 здесь вместо прямого бинанса теперь используем абстрактный метод
-        df = DataLoader.get_exchange_data(safe_symbol, start_date, end_date, interval)
-        if not df.empty:
-            df.to_csv(filename)
-        return df
+                broker = get_broker("bitget")
+                return broker.get_historical_klines(
+                    symbol=symbol,
+                    interval=interval,
+                    start=start_date,
+                    end=end_date,
+                )
+            except Exception as e:
+                print(f"⚠️ [DATA] Bitget failed for {symbol}, fallback to Binance: {e}")
+                return DataLoader.get_binance_data(symbol, start_date, end_date, interval)
+
+        # --- TINKOFF (MOEX акции/валюта) ---
+        if uname == "tinkoff":
+            print(f"📥 [TINKOFF] Загрузка {symbol}.")
+            try:
+                broker = get_broker("tinkoff")
+                return broker.get_historical_klines(
+                    symbol=symbol,
+                    interval=interval,
+                    start=start_date,
+                    end=end_date,
+                )
+            except Exception as e:
+                print(f"⚠️ [DATA] Tinkoff failed for {symbol}, fallback to Binance: {e}")
+                return DataLoader.get_binance_data(symbol, start_date, end_date, interval)
+
+        # --- всё остальное → Binance ---
+        return DataLoader.get_binance_data(symbol, start_date, end_date, interval)
 
     @staticmethod
     def merge_mtf(df_ltf, df_htf):

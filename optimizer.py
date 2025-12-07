@@ -11,6 +11,7 @@ import sys
 from tqdm import tqdm
 from numba import njit
 from config import Config
+from typing import Dict, Any
 
 try:
     from execution_core import simulate_core_logic
@@ -33,23 +34,101 @@ RESULT_FILE = "best_strategy_params.json"
 WFO_REPORT_FILE = "wfo_optimization_report.csv"
 SETTINGS_FILE = "optimizer_settings.json"
 
-# Дефолтные настройки, если JSON не найден
-DEFAULT_RANGES = {
+# --- ДЕФОЛТНЫЕ ДИАПАЗОНЫ ДЛЯ ОПТИМИЗАТОРА ---
+
+# Крипта: более широкие тренды, большие TP, длиннее удержание
+CRYPTO_DEFAULT_RANGES = {
     "sl_min": 1.5, "sl_max": 2.5,
     "tp_min": 3.0, "tp_max": 6.0,
     "conf_min": 0.65, "conf_max": 0.85,
     "pullback_min": 0.0, "pullback_max": 0.15,
     "trail_act_min": 1.2, "trail_act_max": 2.0,
-    "max_hold_min": 24, "max_hold_max": 72
+    "max_hold_min": 24, "max_hold_max": 72,
+    "train_window": 800,
+    "test_window": 400,
 }
 
-def load_settings():
-    if os.path.exists(SETTINGS_FILE):
-        try:
-            with open(SETTINGS_FILE, "r") as f:
-                return json.load(f)
-        except: pass
-    return DEFAULT_RANGES
+# Акции (Тинькофф / MOEX): движения мягче, держим меньше, цели ближе
+STOCKS_DEFAULT_RANGES = {
+    "sl_min": 1.0, "sl_max": 2.0,
+    "tp_min": 1.5, "tp_max": 4.0,
+    "conf_min": 0.55, "conf_max": 0.80,
+    "pullback_min": 0.0, "pullback_max": 0.20,
+    "trail_act_min": 0.8, "trail_act_max": 1.8,
+    "max_hold_min": 16, "max_hold_max": 64,
+    "train_window": 600,
+    "test_window": 300,
+}
+
+DEFAULT_RANGES = CRYPTO_DEFAULT_RANGES  # для обратной совместимости
+
+def load_settings() -> Dict[str, Any]:
+    """
+    Загружает диапазоны параметров для генетического оптимизатора.
+
+    Приоритет профиля:
+    1) ENV OPTIMIZER_PROFILE: crypto / stocks / both / auto
+    2) Config.UNIVERSE_MODE, если OPTIMIZER_PROFILE=auto
+    """
+    # --- 1. Читаем профиль из ENV ---
+    env_profile = os.getenv("OPTIMIZER_PROFILE", "auto").lower()
+
+    # --- 2. Профиль по умолчанию — из UNIVERSE_MODE ---
+    try:
+        mode = getattr(Config, "UNIVERSE_MODE", None)
+        universe_profile = getattr(mode, "value", "both") if mode is not None else "both"
+    except Exception:
+        universe_profile = "both"
+
+    # --- 3. Итоговый ключ профиля ---
+    if env_profile in ("crypto", "stocks", "both"):
+        profile_key = env_profile
+    else:
+        profile_key = universe_profile
+
+    # --- 4. Базовые диапазоны по профилю ---
+    base_map: Dict[str, Any] = {
+        "crypto": CRYPTO_DEFAULT_RANGES,
+        "stocks": STOCKS_DEFAULT_RANGES,
+        "both":   CRYPTO_DEFAULT_RANGES,  # both по умолчанию crypto
+    }
+    base_settings: Dict[str, Any] = dict(base_map.get(profile_key, CRYPTO_DEFAULT_RANGES))
+
+    # --- 5. Подмешиваем overrides из optimizer_settings.json, если есть ---
+    final_settings: Dict[str, Any] = dict(base_settings)
+
+    try:
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            overrides: Dict[str, Any] = {}
+
+            if isinstance(data, dict):
+                # Вариант 1: будущий формат с "profiles" внутри
+                if "profiles" in data and isinstance(data["profiles"], dict):
+                    profiles = data["profiles"]
+                    prof = profiles.get(profile_key)
+                    if isinstance(prof, dict):
+                        overrides = prof
+                else:
+                    # Вариант 2: текущий формат GUI — профили на верхнем уровне
+                    if profile_key in data and isinstance(data[profile_key], dict):
+                        overrides = data[profile_key]
+                    # Вариант 3: старый плоский формат: sl_min/tp_min в корне
+                    elif ("sl_min" in data) or ("tp_min" in data):
+                        overrides = data
+
+            for param_name, bounds in overrides.items():
+                final_settings[param_name] = bounds
+
+    except Exception as e:
+        print(f"⚠️ load_settings: error while reading {SETTINGS_FILE}: {e}")
+
+    print(f"[OPTIMIZER] Active profile: {profile_key} (env={env_profile}, universe={universe_profile})")
+    print(f"[OPTIMIZER] Parameters loaded: {len(final_settings)}")
+
+    return final_settings
 
 # Глобальная переменная для настроек, чтобы не читать файл миллион раз
 GENE_RANGES = load_settings()

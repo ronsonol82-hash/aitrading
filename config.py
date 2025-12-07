@@ -141,25 +141,87 @@ class Config:
     MAX_DAILY_DRAWDOWN = 0.05 
 
     # --- ГЛОБАЛЬНЫЕ ПЕРЕКЛЮЧАТЕЛИ (FIXED) ---
-    USE_TRAILING = True     # <--- ВОТ ЧЕГО НЕ ХВАТАЛО
-    USE_TIME_DECAY = True   # <--- Апгрейд: выход по времени
+    USE_TRAILING = True     # Включаем трейлинг-стоп
+    USE_TIME_DECAY = True   # Выход по времени всё ещё глобальный
 
-    # config.py
-    DEFAULT_STRATEGY = {
-        'sl': 2.0,
-        'tp': 3.5,       # Целимся в 3.5 ATR (это ширина среднего канала)
-        'conf': 0.60,    # Не требуем 100% уверенности, берем объемом
-        'vol_exit': 6.0,
-        'trail_on': 1.0, 
-        'trail_act': 1.2, # Включаем защиту рано!
-        'trail_off': 0.3, # Тралим плотно
-        'max_hold': 48,
-        'mode': 'sniper',
-        'abort': 0.75,
-        'pullback': 0.20,
-        'fill_wait': 8
+    # --- Профили настроек под разные юниверсы ---
+    CRYPTO_MM = {
+        "TIMEFRAME_LTF": "4h",   # как и было — 4H крипта
+        "TIMEFRAME_HTF": "1d",
+        "DEPOSIT": 1000,
+        "RISK_PER_TRADE": 0.02,
+        "MAX_OPEN_POSITIONS": 4,
+        "COMMISSION": 0.00075,
+        "SLIPPAGE": 0.0005,
+        "MAX_DAILY_DRAWDOWN": 0.05,
+        "STRATEGY": {
+            "sl": 2.0,
+            "tp": 3.5,       # таргет 3.5 ATR под криптовый тренд
+            "conf": 0.60,
+            "vol_exit": 6.0,
+            "trail_on": 1.0,
+            "trail_act": 1.2,
+            "trail_off": 0.3,
+            "max_hold": 48,  # 48 баров 4h ≈ 8 суток
+            "mode": "sniper",
+            "abort": 0.75,
+            "pullback": 0.20,
+            "fill_wait": 8,
+        },
     }
-    
+
+    STOCKS_MM = {
+        "TIMEFRAME_LTF": "1h",   # базовый ТФ для акций (ниже агрегацию сделаем в data_loader)
+        "TIMEFRAME_HTF": "1d",
+        "DEPOSIT": 1000,
+        "RISK_PER_TRADE": 0.01,  # аккуратнее с риском
+        "MAX_OPEN_POSITIONS": 2,
+        "COMMISSION": 0.00025,   # ближе к реалиям МОЕХ
+        "SLIPPAGE": 0.0008,
+        "MAX_DAILY_DRAWDOWN": 0.03,
+        "STRATEGY": {
+            "sl": 1.5,           # стоп ближе — вола меньше
+            "tp": 2.5,           # тейк тоже ближе
+            "conf": 0.55,        # чуть мягче порог уверенности
+            "vol_exit": 4.0,     # быстрее выходим по всплеску волы
+            "trail_on": 1.0,
+            "trail_act": 0.8,    # трейлинг включаем раньше
+            "trail_off": 0.4,    # даём немного больше воздуха
+            "max_hold": 32,      # 32 бара 1h ≈ до 4 торговых дней
+            "mode": "sniper",
+            "abort": 0.75,
+            "pullback": 0.15,    # поменьше откат для входа
+            "fill_wait": 12,     # чуть больше времени на исполнение
+        },
+    }
+
+    # --- Применяем профиль к публичным атрибутам ---
+    if UNIVERSE_MODE == UniverseMode.CRYPTO:
+        _mm = CRYPTO_MM
+    elif UNIVERSE_MODE == UniverseMode.STOCKS:
+        _mm = STOCKS_MM
+    else:
+        # BOTH: по умолчанию работаем как крипто-профиль,
+        # а акции будем подстраивать отдельной логикой
+        _mm = CRYPTO_MM
+
+    # Таймфреймы
+    TIMEFRAME_LTF = _mm["TIMEFRAME_LTF"]
+    TIMEFRAME_HTF = _mm["TIMEFRAME_HTF"]
+
+    # Money management
+    DEPOSIT = _mm["DEPOSIT"]
+    RISK_PER_TRADE = _mm["RISK_PER_TRADE"]
+    MAX_OPEN_POSITIONS = _mm["MAX_OPEN_POSITIONS"]
+
+    # Комиссии и риски по дню
+    COMMISSION = _mm["COMMISSION"]
+    SLIPPAGE = _mm["SLIPPAGE"]
+    MAX_DAILY_DRAWDOWN = _mm["MAX_DAILY_DRAWDOWN"]
+
+    # Параметры стратегии по умолчанию
+    DEFAULT_STRATEGY = _mm["STRATEGY"]
+
     # --- ML CONSTANTS ---
     LOOK_AHEAD = 12         
     RR_RATIO = 1.5
@@ -310,6 +372,29 @@ class Config:
 
     TG_API_ID = os.getenv("TELEGRAM_API_ID")
     TG_API_HASH = os.getenv("TELEGRAM_API_HASH")
+
+    # --- Telegram channels per universe ---
+    TG_CRYPTO_CHANNELS = [
+        'tree_of_alpha',
+        'unusual_whales',
+        'WatcherGuru',
+        'Tier10k',
+        'WalterBloomberg',
+        'Cointelegraph',
+        'CryptoTownEU',
+    ]
+
+    TG_STOCK_CHANNELS = [
+        'smartlab_ru',
+        'moex_official',
+        'finam_ru',
+        'rbc_invest',
+    ]
+
+    # --- Flags: enable / disable Telegram HTF per asset class ---
+    # Читаются из ENV или .env через load_dotenv() в начале файла.
+    USE_TG_CRYPTO = os.getenv("USE_TG_CRYPTO", "1") == "1"
+    USE_TG_STOCKS = os.getenv("USE_TG_STOCKS", "1") == "1"
 
     @classmethod
     def equity_symbols(cls) -> list[str]:
