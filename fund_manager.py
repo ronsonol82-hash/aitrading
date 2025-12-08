@@ -1659,9 +1659,46 @@ class FundManagerWindow(QMainWindow):
         self.run_script("signal_generator.py", args)
 
     def run_universal_generator(self):
-        # Явно указываем режим через флаг --mode
+        """
+        Запуск Universal Brain из GUI.
+
+        BACKTEST  -> старый sync-режим (только генерация сигналов).
+        PAPER/LIVE -> async-режим с ExecutionRouter и брокером.
+        """
+        from config import ExecutionMode  # локальный импорт, чтобы не тянуть наверх
+
+        # Базовые аргументы, как раньше
         args = ["--mode", "universal", "--preset", "grinder", "--cross_asset_wf"]
         args += self._build_wfo_cli()
+
+        # Определяем текущий режим исполнения
+        mode_obj = getattr(Config, "EXECUTION_MODE", ExecutionMode.BACKTEST)
+
+        # По умолчанию работаем в синхронном backtest-режиме
+        use_async = isinstance(mode_obj, ExecutionMode) and mode_obj in (
+            ExecutionMode.PAPER,
+            ExecutionMode.LIVE,
+        )
+
+        if use_async:
+            # Берём брокера из конфига (если нет — падаем на bitget)
+            broker_name = getattr(Config, "DEFAULT_BROKER", "bitget")
+
+            args += [
+                "--async_mode",
+                "--broker", broker_name,
+                # Параметры ниже можно не передавать, т.к. в скрипте есть дефолты.
+                # "--portfolio_size", "10",
+                # "--risk_level", "0.02",
+            ]
+
+            print(
+                f"[GUI] Universal generator: ASYNC mode via broker={broker_name} "
+                f"(execution_mode={mode_obj.value})"
+            )
+        else:
+            print("[GUI] Universal generator: SYNC BACKTEST mode")
+
         self.run_script("signal_generator.py", args)
 
     # --- НОВОЕ: кнопки Train Crypto / Train Stocks Brain ---

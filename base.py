@@ -37,7 +37,7 @@ class OrderResult:
     quantity: float
     price: float
     status: str           # например: "new", "filled", "partially_filled", "canceled"
-    broker: str           # имя брокера: "bitget", "tinkoff", "simulated"
+    broker: str           # имя брокера: "bitget", "tinkoff", "bitget_sim", "tinkoff_sim", ...
 
 
 @dataclass
@@ -67,15 +67,35 @@ class AccountState:
 class BrokerAPI(ABC):
     """
     Базовый контракт для любых брокеров (Bitget, Tinkoff, симулятор).
-    Все реальные клиенты будут реализовывать этот интерфейс.
+
+    ВАЖНО:
+      - Все сетевые/торговые операции объявлены как async;
+      - Вызывающий код обязан их вызывать через `await`.
     """
 
     name: str
 
+    # --- Жизненный цикл брокера ---
+
+    @abstractmethod
+    async def initialize(self) -> None:
+        """
+        Асинхронная инициализация (создание HTTP-сессий, подготовка ресурсов).
+        Может быть пустой, если брокеру ничего не нужно.
+        """
+        ...
+
+    @abstractmethod
+    async def close(self) -> None:
+        """
+        Освобождение ресурсов (закрытие HTTP-сессий и т.п.).
+        """
+        ...
+
     # --- Маркет-дата ---
 
     @abstractmethod
-    def get_historical_klines(
+    async def get_historical_klines(
         self,
         symbol: str,
         interval: str,
@@ -89,7 +109,7 @@ class BrokerAPI(ABC):
         ...
 
     @abstractmethod
-    def get_current_price(self, symbol: str) -> float:
+    async def get_current_price(self, symbol: str) -> float:
         """
         Текущая цена инструмента.
         """
@@ -98,14 +118,14 @@ class BrokerAPI(ABC):
     # --- Аккаунт / портфель ---
 
     @abstractmethod
-    def get_account_state(self) -> AccountState:
+    async def get_account_state(self) -> AccountState:
         """
         Текущее состояние аккаунта у брокера.
         """
         ...
 
     @abstractmethod
-    def list_open_positions(self) -> List[Position]:
+    async def list_open_positions(self) -> List[Position]:
         """
         Список открытых позиций.
         """
@@ -114,20 +134,31 @@ class BrokerAPI(ABC):
     # --- Торговля ---
 
     @abstractmethod
-    def place_order(self, order: OrderRequest) -> OrderResult:
+    async def place_order(self, order: OrderRequest) -> OrderResult:
         """
         Разместить ордер у брокера.
         """
         ...
 
     @abstractmethod
-    def cancel_order(self, order_id: str) -> None:
+    async def cancel_order(self, order_id: str) -> None:
         """
         Отменить ордер по его ID.
         """
         ...
+
+    @abstractmethod
+    async def get_open_orders(self, symbol: str) -> List[OrderResult]:
+        """
+        Список активных ордеров по инструменту.
+        В симуляторе на первом этапе может возвращать пустой список.
+        """
+        ...
+
+
 # ================================
 # Unified Broker Interface Mixin
+# (оставляем как есть, на будущее)
 # ================================
 class UnifiedBrokerMixin:
     """

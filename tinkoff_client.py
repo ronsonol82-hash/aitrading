@@ -1,10 +1,9 @@
 # brokers/tinkoff_client.py
-
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any
-
+import asyncio
 import json
 import time
 
@@ -19,14 +18,10 @@ class TinkoffV2Broker(BrokerAPI):
     """
     Клиент для Tinkoff Invest API v2 через REST-gateway.
 
-    Используем только:
-      - MarketDataService/GetCandles      -> get_historical_klines
-      - MarketDataService/GetLastPrices   -> get_current_price
-
-    Всё, что касается реального счёта и торговли, оставляем
-    NotImplemented, т.к. в backtest/paper все операции делает
-    SimulatedBroker, а твой ExecutionRouter может аккуратно
-    обойтись без этих методов в live-режиме до их реализации.
+    Сейчас:
+      - get_historical_klines  -> async через asyncio.to_thread
+      - get_current_price      -> async через asyncio.to_thread
+      - остальное (торговля, аккаунт) — NotImplemented
     """
 
     name = "tinkoff"  # важно: совпадает с uname="tinkoff" в brokers.__init__
@@ -66,13 +61,25 @@ class TinkoffV2Broker(BrokerAPI):
         )
 
         # --- глобальный rate-limit для исторических свечей ---
-        # Для GetCandles по доке: 30 запросов/мин → ≥2 сек между запросами.
-        # Берём небольшой запас.
         self._history_min_interval = 60.0 / 25.0  # ~2.4с
         self._last_history_call_ts: float = 0.0
 
     # =====================================================================
-    # ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
+    # Lifecycle
+    # =====================================================================
+
+    async def initialize(self) -> None:
+        # здесь ничего особенного, но для единообразия интерфейса пусть будет
+        return None
+
+    async def close(self) -> None:
+        try:
+            self.session.close()
+        except Exception:
+            pass
+
+    # =====================================================================
+    # ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ (sync)
     # =====================================================================
 
     @staticmethod
@@ -89,8 +96,6 @@ class TinkoffV2Broker(BrokerAPI):
     def _interval_to_v2_enum(interval: str) -> str:
         """
         Маппинг внутренних интервалов на CandleInterval v2.
-
-        Полный список см. в доке, здесь — самые нужные.
         """
         norm = interval.lower()
 
@@ -113,8 +118,7 @@ class TinkoffV2Broker(BrokerAPI):
     @staticmethod
     def _max_delta_for_interval(interval: str) -> timedelta:
         """
-        Максимальный допустимый период для одного запроса GetCandles
-        (по официальным ограничениям, иначе ошибка 30014).
+        Максимальный допустимый период для одного запроса GetCandles.
         """
         norm = interval.lower()
 
@@ -233,31 +237,19 @@ class TinkoffV2Broker(BrokerAPI):
                     continue
                 raise
 
-        # теоретически сюда не дойдём, но на всякий случай:
         raise RuntimeError("TinkoffV2Broker: исчерпаны попытки запроса к API.")
 
-    # =====================================================================
-    # BrokerAPI: MARKET DATA
-    # =====================================================================
+    # ---------------------------------------------------------------------
+    # Sync-хелпер для свечей
+    # ---------------------------------------------------------------------
 
-    def get_historical_klines(
+    def _get_historical_klines_sync(
         self,
         symbol: str,
         interval: str,
         start: datetime,
         end: datetime,
     ) -> pd.DataFrame:
-        """
-        Исторические свечи через MarketDataService/GetCandles (v2).
-
-        ВАЖНО:
-        - Диапазон [start; end] режем на окна фиксированной длины max_delta.
-        - Окно сдвигаем по cur_to (а не по последней свече), чтобы
-          не зациклиться, даже если API вернёт "кривые" времена.
-
-        На выходе: DataFrame с индексом open_time (naive UTC) и колонками:
-        open, high, low, close, volume, taker_buy_base, funding_rate, imbalance.
-        """
         # --- Нормализуем время в UTC ---
         if start.tzinfo is None:
             start = start.replace(tzinfo=timezone.utc)
@@ -324,7 +316,6 @@ class TinkoffV2Broker(BrokerAPI):
 
             candles = raw.get("candles", [])
             if not candles:
-                # В этом окне данных нет — двигаемся дальше по времени
                 cur_from = cur_to
                 continue
 
@@ -351,10 +342,8 @@ class TinkoffV2Broker(BrokerAPI):
                     print(f"[TINKOFF V2] skip bad candle: {e}")
                     continue
 
-            # КЛЮЧЕВОЕ: окно сдвигаем по cur_to, а не по последней свече
             cur_from = cur_to
 
-        # --- Сборка DataFrame ---
         if not rows:
             return pd.DataFrame(
                 columns=[
@@ -370,10 +359,7 @@ class TinkoffV2Broker(BrokerAPI):
             )
 
         df = pd.DataFrame(rows)
-
-        # На всякий случай убираем возможные дубликаты по времени
         df.drop_duplicates(subset=["open_time"], keep="last", inplace=True)
-
         df.sort_values("open_time", inplace=True)
         df.set_index("open_time", inplace=True)
 
@@ -390,10 +376,11 @@ class TinkoffV2Broker(BrokerAPI):
             ]
         ]
 
-    def get_current_price(self, symbol: str) -> float:
-        """
-        Последняя цена через MarketDataService/GetLastPrices.
-        """
+    # ---------------------------------------------------------------------
+    # Sync-хелпер для цены
+    # ---------------------------------------------------------------------
+
+    def _get_current_price_sync(self, symbol: str) -> float:
         figi = self._resolve_figi(symbol)
 
         url = (
@@ -421,30 +408,55 @@ class TinkoffV2Broker(BrokerAPI):
         return self._q_to_float(price_obj)
 
     # =====================================================================
-    # BrokerAPI: ACCOUNT / TRADING  (пока заглушки)
+    # BrokerAPI: MARKET DATA (async-обёртки)
     # =====================================================================
 
-    def get_account_state(self) -> AccountState:
-        """
-        Реальный аккаунт Tinkoff пока не трогаем — в режимах backtest/paper
-        всё делает SimulatedBroker. В live-режиме ExecutionRouter должен
-        вызывать этот метод только после явной реализации.
-        """
+    async def get_historical_klines(
+        self,
+        symbol: str,
+        interval: str,
+        start: datetime,
+        end: datetime,
+    ) -> pd.DataFrame:
+        return await asyncio.to_thread(
+            self._get_historical_klines_sync,
+            symbol,
+            interval,
+            start,
+            end,
+        )
+
+    async def get_current_price(self, symbol: str) -> float:
+        return await asyncio.to_thread(
+            self._get_current_price_sync,
+            symbol,
+        )
+
+    # =====================================================================
+    # BrokerAPI: ACCOUNT / TRADING (пока заглушки)
+    # =====================================================================
+
+    async def get_account_state(self) -> AccountState:
         raise NotImplementedError(
             "TinkoffV2Broker.get_account_state is not implemented yet."
         )
 
-    def list_open_positions(self) -> List[Position]:
+    async def list_open_positions(self) -> List[Position]:
         raise NotImplementedError(
             "TinkoffV2Broker.list_open_positions is not implemented yet."
         )
 
-    def place_order(self, order: OrderRequest) -> OrderResult:
+    async def place_order(self, order: OrderRequest) -> OrderResult:
         raise NotImplementedError(
             "TinkoffV2Broker.place_order is not implemented yet."
         )
 
-    def cancel_order(self, order_id: str) -> None:
+    async def cancel_order(self, order_id: str) -> None:
         raise NotImplementedError(
             "TinkoffV2Broker.cancel_order is not implemented yet."
+        )
+
+    async def get_open_orders(self, symbol: str) -> List[OrderResult]:
+        raise NotImplementedError(
+            "TinkoffV2Broker.get_open_orders is not implemented yet."
         )

@@ -9,6 +9,7 @@ from brokers import (
     get_broker,
     BrokerAPI,
     OrderRequest,
+    OrderResult,
     AccountState,
     Position,
 )
@@ -26,13 +27,13 @@ class GlobalAccountState:
 
 class ExecutionRouter:
     """
-    Роутер исполнения ордеров и сигналов.
-
+    Асинхронный роутер исполнения ордеров и сигналов.
+    
     Задачи:
       - знает, какой символ к какому брокеру относится (Config.ASSET_ROUTING);
       - лениво поднимает брокеров через get_broker(name);
       - агрегирует состояние счёта и позиции по всем брокерам;
-      - даёт простые методы execute_order / execute_signal.
+      - даёт простые async методы execute_order / execute_signal.
     """
 
     def __init__(
@@ -52,15 +53,35 @@ class ExecutionRouter:
         # Локальный кеш брокеров: "bitget" -> BrokerAPI
         self._brokers: Dict[str, BrokerAPI] = {}
 
-        # Прединициализируем всех брокеров из маршрутизации
+    # ---------- Lifecycle ----------
+    
+    async def initialize(self) -> None:
+        """
+        Асинхронная инициализация всех брокеров.
+        Вызывается перед первым использованием роутера.
+        """
         broker_names = set(self.asset_routing.values())
         broker_names.add(self.default_broker)
 
         for name in broker_names:
             try:
-                self._brokers[name] = get_broker(name)
+                broker = get_broker(name)
+                await broker.initialize()
+                self._brokers[name] = broker
             except Exception as e:
                 print(f"[WARN] ExecutionRouter: failed to init broker '{name}': {e}")
+
+    async def close(self) -> None:
+        """
+        Корректное закрытие всех брокеров.
+        """
+        for name, broker in list(self._brokers.items()):
+            try:
+                await broker.close()
+            except Exception as e:
+                print(f"[WARN] ExecutionRouter: failed to close broker '{name}': {e}")
+            finally:
+                self._brokers.pop(name, None)
 
     # ---------- Вспомогательные методы ----------
 
@@ -71,19 +92,23 @@ class ExecutionRouter:
         """
         return self.asset_routing.get(symbol, self.default_broker)
 
-    def get_broker_for_symbol(self, symbol: str) -> BrokerAPI:
+    async def get_broker_for_symbol(self, symbol: str) -> BrokerAPI:
         """
-        Получить инстанс брокера для тикера.
+        Получить инстанс брокера для тикера (ленивая инициализация).
         """
         name = self.get_broker_name_for_symbol(symbol)
         if name not in self._brokers:
-            # Ленивое создание, если не получилось на старте
-            self._brokers[name] = get_broker(name)
+            try:
+                broker = get_broker(name)
+                await broker.initialize()
+                self._brokers[name] = broker
+            except Exception as e:
+                raise RuntimeError(f"Failed to initialize broker '{name}' for symbol '{symbol}': {e}")
         return self._brokers[name]
 
     # ---------- Высокоуровневые операции ----------
 
-    def execute_order(
+    async def execute_order(
         self,
         symbol: str,
         side: str,
@@ -91,14 +116,14 @@ class ExecutionRouter:
         order_type: str = "market",
         price: Optional[float] = None,
         client_id: Optional[str] = None,
-    ):
+    ) -> OrderResult:
         """
         Универсальное исполнение ордера:
           - выбирает брокера по symbol;
           - формирует OrderRequest;
           - отправляет в broker.place_order.
         """
-        broker = self.get_broker_for_symbol(symbol)
+        broker = await self.get_broker_for_symbol(symbol)
         order = OrderRequest(
             symbol=symbol,
             side=side,  # "buy" / "sell"
@@ -107,22 +132,22 @@ class ExecutionRouter:
             price=price,
             client_id=client_id,
         )
-        return broker.place_order(order)
+        return await broker.place_order(order)
 
-    def execute_signal(
+    async def execute_signal(
         self,
         symbol: str,
         pos_type: str,
         size: float,
         price: Optional[float] = None,
         client_id: Optional[str] = None,
-    ):
+    ) -> OrderResult:
         """
         Обертка над execute_order для сигналов стратегии:
           pos_type: "LONG" / "SHORT"
         """
         side = "buy" if pos_type.upper() == "LONG" else "sell"
-        return self.execute_order(
+        return await self.execute_order(
             symbol=symbol,
             side=side,
             quantity=size,
@@ -131,7 +156,7 @@ class ExecutionRouter:
             client_id=client_id,
         )
 
-    def get_global_account_state(self) -> GlobalAccountState:
+    async def get_global_account_state(self) -> GlobalAccountState:
         """
         Агрегирует состояние по всем брокерам.
         """
@@ -139,9 +164,10 @@ class ExecutionRouter:
         total_balance = 0.0
         details: Dict[str, AccountState] = {}
 
+        # Используем только уже инициализированных брокеров
         for name, broker in self._brokers.items():
             try:
-                state = broker.get_account_state()
+                state = await broker.get_account_state()
             except NotImplementedError:
                 continue
             except Exception as e:
@@ -158,7 +184,7 @@ class ExecutionRouter:
             details=details,
         )
 
-    def list_all_positions(self) -> List[Position]:
+    async def list_all_positions(self) -> List[Position]:
         """
         Собирает все открытые позиции по всем брокерам.
         """
@@ -166,7 +192,7 @@ class ExecutionRouter:
 
         for name, broker in self._brokers.items():
             try:
-                broker_positions = broker.list_open_positions()
+                broker_positions = await broker.list_open_positions()
             except NotImplementedError:
                 continue
             except Exception as e:

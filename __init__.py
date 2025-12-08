@@ -76,7 +76,7 @@ def get_broker(name: str) -> BrokerAPI:
             name=uname,
             data_broker=real_broker,
             starting_equity=starting_equity,
-            currency="USDT",   # для рублёвых инструментов тоже ок как "базовая валюта отчёта"
+            currency="USDT",
         )
         _BROKER_CACHE[cache_key] = sim
         return sim
@@ -85,7 +85,6 @@ def get_broker(name: str) -> BrokerAPI:
     if uname in _BROKER_CACHE:
         return _BROKER_CACHE[uname]
 
-    # Пока умеем только bitget/tinkoff как "живых"
     broker = _create_real_broker(uname)
     _BROKER_CACHE[uname] = broker
     return broker

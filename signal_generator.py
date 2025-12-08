@@ -4,6 +4,7 @@ import numpy as np
 import pickle
 import os
 import sys
+import asyncio
 from tqdm import tqdm
 from datetime import datetime, timedelta
 from config import Config, UniverseMode
@@ -606,8 +607,248 @@ class SignalFactory:
 
         return result
 
+# =================== АСИНХРОННЫЙ ИНТЕРФЕЙС ДЛЯ НОВОГО КОДА ===================
+
+async def async_main(args):
+    """
+    Асинхронная точка входа для новой системы.
+    Поддерживает параметры из GUI / CLI.
+    args — уже распарсенный argparse.Namespace
+    """
+    from config import Config
+    from execution_router import ExecutionRouter
+
+    print(f"🚀 [ASYNC] Запуск в асинхронном режиме")
+    print(f"   📊 Брокер: {args.broker}")
+    print(f"   🎮 Режим: {args.mode}")
+    print(f"   ⚙️  Пресет: {args.preset}")
+    print(f"   🧠 Cross-asset WF: {'Включен' if args.cross_asset_wf else 'Выключен'}")
+
+    # Инициализируем роутер исполнения
+    router = ExecutionRouter()
+    await router.initialize(broker_name=args.broker)
+    
+    try:
+        # Режим UNIVERSAL (Глобальный мозг)
+        if args.mode == "universal":
+            print("\n🧠 [ASYNC] Запуск UniversalSignalFactory...")
+            
+            u_factory = UniversalSignalFactory(
+                regime_preset=args.preset,
+                cross_asset_wf=args.cross_asset_wf,
+                train_window=args.train_window,
+                trade_window=args.trade_window,
+            )
+            
+            # 1. Загрузка данных
+            print("📥 Загрузка данных...")
+            u_factory.load_data()
+            
+            # 2. Обучение (если не только инференс)
+            if not args.inference_only:
+                print("🎓 Обучение глобальной модели...")
+                u_factory.run_universal_training()
+            
+            # 3. Инференс на портфеле (если не только обучение)
+            if not args.universal_only:
+                print("🔮 Генерация сигналов на портфеле...")
+
+                try:
+                    with open(u_factory.OUTPUT_FILE, "rb") as f:
+                        signals = pickle.load(f)
+                    
+                    # Анализ сигналов и выбор портфеля
+                    portfolio_decisions = analyze_portfolio_signals(
+                        signals,
+                        portfolio_size=args.portfolio_size,
+                        risk_level=args.risk_level,
+                    )
+
+                    if portfolio_decisions:
+                        print(f"\n📊 Топ-{len(portfolio_decisions)} сигналов выбраны для портфеля.")
+                        await router.execute_portfolio_decisions(portfolio_decisions)
+                        print(f"✅ Поручения отправлены: {len(portfolio_decisions)} позиций")
+                    else:
+                        print("ℹ️ Подходящих сигналов для портфеля не найдено.")
+                
+                except Exception as e:
+                    print(f"⚠️ Ошибка при анализе сигналов: {e}")
+            
+            print("✅ [ASYNC] Универсальная модель: все операции завершены")
+            
+        else:
+            # WALK-FORWARD режим
+            print("\n🚶 [ASYNC] Запуск SignalFactory (walk-forward)...")
+            
+            factory = SignalFactory(
+                regime_preset=args.preset,
+                force_reset=args.reset,
+                train_window=args.train_window,
+                trade_window=args.trade_window,
+            )
+            
+            print("📥 Загрузка данных...")
+            factory.load_data()
+            
+            print("🔄 Запуск walk-forward...")
+            factory.run_walk_forward()
+            
+            print("📈 Анализ свежих сигналов и подготовка ордеров...")
+            try:
+                with open(factory.OUTPUT_FILE, "rb") as f:
+                    signals = pickle.load(f)
+                
+                latest_signals = get_latest_signals(signals)
+                orders = prepare_orders_from_signals(
+                    latest_signals,
+                    risk_level=args.risk_level,
+                )
+                
+                if orders:
+                    await router.execute_batch_orders(orders)
+                    print(f"✅ Ордера отправлены: {len(orders)}")
+                else:
+                    print("ℹ️ Нет ордеров, удовлетворяющих фильтрам по силе сигнала.")
+            
+            except Exception as e:
+                print(f"⚠️ Ошибка при подготовке ордеров: {e}")
+            
+            print("✅ [ASYNC] Walk-forward завершен")
+            
+    except Exception as e:
+        print(f"❌ [ASYNC] Критическая ошибка: {e}")
+        import traceback
+        traceback.print_exc()
+        
+    finally:
+        await router.close()
+        print("🔒 [ASYNC] Ресурсы освобождены")
+
+
+# =================== КОНЕЦ АСИНХРОННОГО КОДА ===================
+
+# ====== ХЕЛПЕРЫ ДЛЯ АНАЛИЗА СИГНАЛОВ И ПОДГОТОВКИ ОРДЕРОВ ======
+
+def analyze_portfolio_signals(
+    signals: dict,
+    portfolio_size: int = 10,
+    risk_level: float = 0.02,
+):
+    """
+    Анализирует универсальные сигналы и выбирает лучшие позиции для портфеля.
+    (полностью синхронная логика)
+    """
+    decisions = []
+    
+    for symbol, df in signals.items():
+        if df.empty:
+            continue
+            
+        last_row = df.iloc[-1]
+        signal_strength = calculate_signal_strength(last_row)
+        direction = "BUY" if last_row['p_long'] > last_row['p_short'] else "SELL"
+        
+        position_size = calculate_position_size(
+            symbol,
+            last_row.get('atr', 0.01),
+            risk_level,
+        )
+        
+        decisions.append({
+            'symbol': symbol,
+            'direction': direction,
+            'strength': signal_strength,
+            'size': position_size,
+            'timestamp': df.index[-1],
+            'p_long': last_row['p_long'],
+            'p_short': last_row['p_short'],
+            'regime': last_row['regime'],
+        })
+    
+    decisions.sort(key=lambda x: x['strength'], reverse=True)
+    return decisions[:portfolio_size]
+
+
+def calculate_signal_strength(row):
+    """Вычисляет силу сигнала на основе вероятностей и режима."""
+    base_strength = abs(row['p_long'] - row['p_short'])
+    
+    regime_modifier = {
+        0: 0.5,  # нейтральный
+        1: 1.0,  # трендовый
+        2: 0.8,  # волатильный
+        3: 0.6,  # флэтовый
+    }.get(row['regime'], 0.5)
+    
+    return base_strength * regime_modifier
+
+
+def calculate_position_size(symbol, atr, risk_level):
+    """
+    СИНХРОННЫЙ расчёт размера позиции на основе ATR и уровня риска.
+    """
+    from data_loader import DataLoader
+
+    try:
+        end = datetime.now()
+        start = end - timedelta(days=1)
+        data = DataLoader.get_symbol_data(symbol, start, end, '1h')
+        
+        if not data.empty:
+            current_price = data['close'].iloc[-1]
+            atr_value = atr if atr > 0 else data['close'].diff().abs().rolling(14).mean().iloc[-1]
+            atr_distance = atr_value * 2  # стоп на 2 ATR
+            risk_amount = 1000 * risk_level  # риск в деньгах (пока фикс 1000)
+            position_size = risk_amount / atr_distance
+            return min(position_size, 1000)
+    except Exception:
+        pass
+    
+    return 100.0
+
+
+def prepare_orders_from_signals(latest_signals: dict, risk_level: float):
+    """Подготавливает ордера на основе последних сигналов (синхронно)."""
+    orders = []
+    
+    for symbol, row in latest_signals.items():
+        # фильтр по силе сигнала
+        if row['p_long'] < 0.6 and row['p_short'] < 0.6:
+            continue
+            
+        direction = "BUY" if row['p_long'] > row['p_short'] else "SELL"
+        
+        size = calculate_position_size(
+            symbol,
+            row.get('atr', 0.01),
+            risk_level,
+        )
+        
+        orders.append({
+            'symbol': symbol,
+            'side': direction,
+            'quantity': size,
+            'order_type': 'MARKET',
+            'signal_strength': max(row['p_long'], row['p_short']),
+        })
+    
+    return orders
+
+
+def get_latest_signals(signals: dict):
+    """Извлекает последние сигналы из словаря."""
+    latest = {}
+    for symbol, df in signals.items():
+        if not df.empty:
+            latest[symbol] = df.iloc[-1]
+    return latest
+
+
 if __name__ == "__main__":
+    # ЕДИНЫЙ парсер аргументов для sync+async режимов
     parser = argparse.ArgumentParser(description="Signal Factory & ML Trainer")
+
+    # Общие параметры
     parser.add_argument(
         "--preset",
         type=str,
@@ -627,7 +868,6 @@ if __name__ == "__main__":
         choices=["walk", "universal"],
         help="Signal generation mode: walk (per-symbol WF) or universal (global brain)",
     )
-    # NEW: окна WF из GUI
     parser.add_argument(
         "--train_window",
         type=int,
@@ -640,38 +880,78 @@ if __name__ == "__main__":
         default=None,
         help="Trade/OOS window in candles",
     )
-    # NEW: флаг включения Cross-Asset WF
     parser.add_argument(
         "--cross_asset_wf",
         action="store_true",
         help="Enable Cross-Asset Walk-Forward for UNIVERSAL mode",
     )
 
+    # Флаг асинхронного режима
+    parser.add_argument(
+        "--async_mode",
+        action="store_true",
+        help="Run in async mode with GUI support",
+    )
+
+    # Дополнительные параметры только для async-ветки
+    parser.add_argument(
+        "--broker",
+        type=str,
+        default="bitget",
+        help="Broker name (async mode only)",
+    )
+    parser.add_argument(
+        "--portfolio_size",
+        type=int,
+        default=10,
+        help="Number of assets in portfolio (async mode only)",
+    )
+    parser.add_argument(
+        "--risk_level",
+        type=float,
+        default=0.02,
+        help="Risk per trade (async mode only)",
+    )
+    parser.add_argument(
+        "--universal_only",
+        action="store_true",
+        help="Run only universal training (async mode only)",
+    )
+    parser.add_argument(
+        "--inference_only",
+        action="store_true",
+        help="Run only inference (async mode only)",
+    )
+
     args = parser.parse_args()
-
-    if args.mode == "walk":
-        print(f"\n🏭 [FACTORY] Запуск WALK-FORWARD. Preset: {args.preset.upper()}")
-        if args.reset:
-            print("⚠️ FORCE RESET: кэш сигналов будет проигнорирован.")
-
-        factory = SignalFactory(
-            regime_preset=args.preset,
-            force_reset=args.reset,
-            train_window=args.train_window,
-            trade_window=args.trade_window,
-        )
-        factory.load_data()
-        factory.run_walk_forward()
-        print("\n➡️ Следующий шаг: python optimizer.py --mode sniper")
-
+    
+    if args.async_mode:
+        print("🚀 Запуск в асинхронном режиме...")
+        asyncio.run(async_main(args))
     else:
-        print(f"\n🧠 [UNIVERSAL] Запуск универсального мозга. Preset: {args.preset.upper()}")
-        u_factory = UniversalSignalFactory(
-            regime_preset=args.preset,
-            cross_asset_wf=args.cross_asset_wf,
-            train_window=args.train_window,
-            trade_window=args.trade_window,
-        )
-        u_factory.load_data()
-        u_factory.run_universal_training()
-        # Дальше можно сразу гонять backtester по production_signals_v1.pkl
+        # Существующий синхронный код
+        if args.mode == "walk":
+            print(f"\n🏭 [FACTORY] Запуск WALK-FORWARD. Preset: {args.preset.upper()}")
+            if args.reset:
+                print("⚠️ FORCE RESET: кэш сигналов будет проигнорирован.")
+
+            factory = SignalFactory(
+                regime_preset=args.preset,
+                force_reset=args.reset,
+                train_window=args.train_window,
+                trade_window=args.trade_window,
+            )
+            factory.load_data()
+            factory.run_walk_forward()
+            print("\n➡️ Следующий шаг: python optimizer.py --mode sniper")
+
+        else:
+            print(f"\n🧠 [UNIVERSAL] Запуск универсального мозга. Preset: {args.preset.upper()}")
+            u_factory = UniversalSignalFactory(
+                regime_preset=args.preset,
+                cross_asset_wf=args.cross_asset_wf,
+                train_window=args.train_window,
+                trade_window=args.trade_window,
+            )
+            u_factory.load_data()
+            u_factory.run_universal_training()

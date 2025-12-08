@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import pandas as pd
 
@@ -25,9 +25,9 @@ class SimulatedBroker(BrokerAPI):
 
     Идея:
       - для market-data используем реальный брокер (Bitget/Tinkoff),
-        переданный как data_broker;
+        переданный как data_broker (async BrokerAPI);
       - ордера, позиции и PnL считаем локально;
-      - таким образом, один и тот же движок (стратегия) может работать
+      - один и тот же движок (стратегия) может работать
         как с криптой, так и с акциями, не зная, что это симулятор.
     """
 
@@ -51,28 +51,45 @@ class SimulatedBroker(BrokerAPI):
         # Простая генерация ID ордеров
         self._order_seq = 0
 
-    # ---------- MARKET DATA (делегируем реальному брокеру) ----------
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
-    def get_historical_klines(
+    async def initialize(self) -> None:
+        # пробрасываем инициализацию вниз, если нужно
+        if hasattr(self._underlying, "initialize"):
+            await self._underlying.initialize()
+
+    async def close(self) -> None:
+        if hasattr(self._underlying, "close"):
+            await self._underlying.close()
+
+    # ------------------------------------------------------------------
+    # MARKET DATA (делегируем реальному брокеру)
+    # ------------------------------------------------------------------
+
+    async def get_historical_klines(
         self,
         symbol: str,
         interval: str,
         start: datetime,
         end: datetime,
     ) -> pd.DataFrame:
-        return self._underlying.get_historical_klines(
+        return await self._underlying.get_historical_klines(
             symbol=symbol,
             interval=interval,
             start=start,
             end=end,
         )
 
-    def get_current_price(self, symbol: str) -> float:
-        return self._underlying.get_current_price(symbol)
+    async def get_current_price(self, symbol: str) -> float:
+        return await self._underlying.get_current_price(symbol)
 
-    # ---------- ВСПОМОГАТЕЛЬНОЕ: переоценка позиций ----------
+    # ------------------------------------------------------------------
+    # Вспомогательное: переоценка позиций
+    # ------------------------------------------------------------------
 
-    def _revalue_positions(self) -> Dict[str, Position]:
+    async def _revalue_positions(self) -> Dict[str, Position]:
         """
         Пересчитываем нереализованный PnL по всем инструментам.
         Возвращаем snapshot позиций в виде Position.
@@ -83,7 +100,7 @@ class SimulatedBroker(BrokerAPI):
             if state.quantity == 0:
                 continue
 
-            last_price = self.get_current_price(symbol)
+            last_price = await self.get_current_price(symbol)
             qty = state.quantity
             avg = state.avg_price
 
@@ -104,15 +121,17 @@ class SimulatedBroker(BrokerAPI):
 
         return result
 
-    # ---------- ACCOUNT / PORTFOLIO ----------
+    # ------------------------------------------------------------------
+    # ACCOUNT / PORTFOLIO
+    # ------------------------------------------------------------------
 
-    def get_account_state(self) -> AccountState:
+    async def get_account_state(self) -> AccountState:
         """
         Возвращаем сводное состояние счёта:
           - equity = стартовый капитал + реализованный PnL + суммарный нереализованный PnL
           - balance = стартовый капитал + реализованный PnL (без учёта плавающего)
         """
-        positions = self._revalue_positions()
+        positions = await self._revalue_positions()
         total_unrealized = sum(
             p.unrealized_pnl or 0.0 for p in positions.values()
         )
@@ -128,16 +147,19 @@ class SimulatedBroker(BrokerAPI):
             broker=self.name,
         )
 
-    def list_open_positions(self) -> List[Position]:
-        return list(self._revalue_positions().values())
+    async def list_open_positions(self) -> List[Position]:
+        positions = await self._revalue_positions()
+        return list(positions.values())
 
-    # ---------- TRADING LOGIC (упрощённый каркас) ----------
+    # ------------------------------------------------------------------
+    # TRADING LOGIC (упрощённый каркас)
+    # ------------------------------------------------------------------
 
     def _next_order_id(self) -> str:
         self._order_seq += 1
         return f"{self.name}-ord-{self._order_seq}"
 
-    def place_order(self, order: OrderRequest) -> OrderResult:
+    async def place_order(self, order: OrderRequest) -> OrderResult:
         """
         Упрощённая логика:
           - ордер всегда исполняется "мгновенно" по текущей цене
@@ -152,8 +174,10 @@ class SimulatedBroker(BrokerAPI):
             raise ValueError("SimulatedBroker: quantity must be > 0")
 
         # "Исполняем" ордер
-        trade_price = float(order.price) if order.price is not None else float(
-            self.get_current_price(symbol)
+        trade_price = (
+            float(order.price)
+            if order.price is not None
+            else float(await self.get_current_price(symbol))
         )
 
         # Обновляем состояние позиции
@@ -217,9 +241,16 @@ class SimulatedBroker(BrokerAPI):
             broker=self.name,
         )
 
-    def cancel_order(self, order_id: str) -> None:
+    async def cancel_order(self, order_id: str) -> None:
         """
         В текущем каркасе ордеры исполняются мгновенно, так что отмена —
         no-op. Позже можно будет хранить pending-ордера и реально их отменять.
         """
         return None
+
+    async def get_open_orders(self, symbol: str) -> List[OrderResult]:
+        """
+        В текущем каркасе все ордера исполняются мгновенно, так что
+        "открытых" ордеров нет.
+        """
+        return []
