@@ -541,3 +541,26 @@ class BitgetBroker(BrokerAPI):
                 continue
 
         return results
+    
+    def normalize_qty(self, symbol: str, qty: float, price: float | None = None) -> float:
+        # P0: грубая нормализация под spot:
+        # - округляем до 6 знаков
+        # - отсекаем микроскопические значения
+        q = float(qty)
+        if q <= 0:
+            return 0.0
+        q = round(q, 6)
+        if q <= 0:
+            return 0.0
+        return q
+
+    async def close_position(self, symbol: str, reason: str = "") -> None:
+        # P0: spot close = SELL доступного количества монеты (base asset)
+        # Берём позиции через list_open_positions (у тебя это по балансу монет)
+        positions = await self.list_open_positions()
+        pos = next((p for p in positions if p.symbol == symbol and float(p.quantity or 0.0) > 0), None)
+        if pos is None:
+            return
+
+        order = OrderRequest(symbol=symbol, side="sell", quantity=float(pos.quantity), order_type="market")
+        await self.place_order(order)

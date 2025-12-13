@@ -6,6 +6,8 @@ import os
 import numpy as np
 import redis
 import json
+import inspect
+import asyncio
 from datetime import datetime, timedelta
 from config import Config, UniverseMode
 from brokers import get_broker
@@ -176,17 +178,24 @@ class DataLoader:
         if uname == "bitget":
             try:
                 broker = get_broker("bitget")
-                return broker.get_historical_klines(
+                df = broker.get_historical_klines(
                     symbol=symbol,
                     interval=interval,
                     start=start_date,
                     end=end_date,
                 )
+                df = DataLoader._ensure_sync_df(
+                    df,
+                    source="bitget",
+                    symbol=symbol,
+                    interval=interval,
+                )
+                return df
             except Exception as e:
                 print(f"⚠️ [DATA] Bitget failed for {symbol}, fallback to Binance: {e}")
                 return DataLoader.get_binance_data(symbol, start_date, end_date, interval)
 
-        # --- TINKOFF (акции МОЕХ, тоже только явно маршрутизированные) ---
+        # --- TINKOFF (MOEX акции/валюта) ---
         if uname == "tinkoff":
             print(f"📥 [TINKOFF] Загрузка {symbol} (interval={interval})...")
             try:
@@ -200,8 +209,14 @@ class DataLoader:
                     start=start_date,
                     end=end_date,
                 )
+                df = DataLoader._ensure_sync_df(
+                    df,
+                    source="tinkoff",
+                    symbol=symbol,
+                    interval=raw_interval,
+                )
 
-                if df is None or df.empty:
+                if df.empty:
                     print(f"⚠️ [TINKOFF] Пустые данные для {symbol}")
                     return df
 
@@ -231,20 +246,16 @@ class DataLoader:
                     if "volume" in df.columns:
                         agg["volume"] = "sum"
 
-                    # Если вдруг есть тиковые/доп.колонки — пытаемся агрегировать разумно
+                    # Доп. колонки
                     for col in df.columns:
                         if col in agg:
                             continue
-                        # Объёмоподобные — суммируем
                         if any(x in col for x in ["volume", "vol", "taker"]):
                             agg[col] = "sum"
                         else:
-                            # Остальное — среднее (ставки, индексы и т.п.)
                             agg[col] = "mean"
 
                     df_4h = df.resample("4H").agg(agg)
-
-                    # Убираем полностью пустые бары
                     df_4h = df_4h.dropna(how="all")
 
                     if "close" in df_4h.columns:
@@ -260,7 +271,7 @@ class DataLoader:
             except Exception as e:
                 print(f"⚠️ [DATA] Tinkoff failed for {symbol}, fallback to Binance: {e}")
                 return DataLoader.get_binance_data(symbol, start_date, end_date, interval)
-            
+
         # --- ВСЁ ОСТАЛЬНОЕ → Binance как универсальный поставщик истории ---
         return DataLoader.get_binance_data(symbol, start_date, end_date, interval)
 
@@ -360,49 +371,39 @@ class DataLoader:
         return df
 
     @staticmethod
-    def get_exchange_data(symbol, start_date, end_date, interval):
+    def _ensure_sync_df(result, source: str, symbol: str, interval: str):
         """
-        Унифицированная точка входа для загрузки свечей с биржи.
-
-        Логика:
-        - смотрим Config.ASSET_ROUTING → определяем брокера;
-        - если брокер = bitget/tinkoff, пробуем его,
-        при ошибке — fallback на Binance.
+        Превращает возможную корутину / None в нормальный pandas.DataFrame.
+        Используется только внутри DataLoader.get_exchange_data.
         """
-        broker_name = Config.ASSET_ROUTING.get(symbol, Config.DEFAULT_BROKER)
-        uname = str(broker_name).lower() if broker_name else None
+        import pandas as pd
 
-        # --- BITGET (крипта) ---
-        if uname == "bitget":
+        # 1) Если брокер вернул корутину (async def get_historical_klines)
+        if inspect.iscoroutine(result):
             try:
-                broker = get_broker("bitget")
-                return broker.get_historical_klines(
-                    symbol=symbol,
-                    interval=interval,
-                    start=start_date,
-                    end=end_date,
-                )
-            except Exception as e:
-                print(f"⚠️ [DATA] Bitget failed for {symbol}, fallback to Binance: {e}")
-                return DataLoader.get_binance_data(symbol, start_date, end_date, interval)
+                result = asyncio.run(result)
+            except RuntimeError:
+                # На случай, если вдруг уже есть event loop
+                loop = asyncio.get_event_loop()
+                result = loop.run_until_complete(result)
 
-        # --- TINKOFF (MOEX акции/валюта) ---
-        if uname == "tinkoff":
-            print(f"📥 [TINKOFF] Загрузка {symbol}.")
+        # 2) None → пустой DataFrame
+        if result is None:
+            print(f"⚠️ [{source}] None для {symbol} ({interval}) → пустой DataFrame")
+            return pd.DataFrame()
+
+        # 3) Если это не DataFrame — пробуем аккуратно обернуть
+        if not isinstance(result, pd.DataFrame):
+            print(
+                f"⚠️ [{source}] Неожиданный тип {type(result)} для {symbol}, "
+                "оборачиваем в DataFrame"
+            )
             try:
-                broker = get_broker("tinkoff")
-                return broker.get_historical_klines(
-                    symbol=symbol,
-                    interval=interval,
-                    start=start_date,
-                    end=end_date,
-                )
-            except Exception as e:
-                print(f"⚠️ [DATA] Tinkoff failed for {symbol}, fallback to Binance: {e}")
-                return DataLoader.get_binance_data(symbol, start_date, end_date, interval)
+                result = pd.DataFrame(result)
+            except Exception:
+                return pd.DataFrame()
 
-        # --- всё остальное → Binance ---
-        return DataLoader.get_binance_data(symbol, start_date, end_date, interval)
+        return result
 
     @staticmethod
     def merge_mtf(df_ltf, df_htf):

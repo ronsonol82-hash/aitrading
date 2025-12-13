@@ -176,6 +176,19 @@ class TinkoffV2Broker(BrokerAPI):
                 f"Добавь его в Config.TINKOFF_FIGI_MAP."
             )
         return figi
+    
+    @staticmethod
+    def _resolve_ticker(figi: str) -> str:
+        """
+        Reverse-map FIGI -> TICKER через Config.TINKOFF_FIGI_MAP.
+        Если FIGI не найден — возвращаем исходный figi (fallback).
+        """
+        from config import Config  # локальный импорт, чтобы не ловить циклы
+
+        figi_map = getattr(Config, "TINKOFF_FIGI_MAP", {}) or {}
+        # P0.5+: строим обратный мап на лету (в P0 достаточно; позже можно кэшировать)
+        reverse = {v: k for k, v in figi_map.items() if v}
+        return reverse.get(figi, figi)
 
     def _post_with_backoff(
         self,
@@ -407,6 +420,17 @@ class TinkoffV2Broker(BrokerAPI):
         price_obj = prices[0].get("price", {})
         return self._q_to_float(price_obj)
 
+    def _get_accounts_sync(self) -> list[dict]:
+        url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.UsersService/GetAccounts"
+        resp = self._post_with_backoff(url, payload={}, timeout=10, is_history=False)
+        return resp.json().get("accounts", []) or []
+
+    def _get_portfolio_sync(self, account_id: str) -> dict:
+        url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.OperationsService/GetPortfolio"
+        payload = {"accountId": account_id}
+        resp = self._post_with_backoff(url, payload=payload, timeout=10, is_history=False)
+        return resp.json() or {}
+
     # =====================================================================
     # BrokerAPI: MARKET DATA (async-обёртки)
     # =====================================================================
@@ -437,26 +461,157 @@ class TinkoffV2Broker(BrokerAPI):
     # =====================================================================
 
     async def get_account_state(self) -> AccountState:
-        raise NotImplementedError(
-            "TinkoffV2Broker.get_account_state is not implemented yet."
-        )
+        def _sync():
+            accounts = self._get_accounts_sync()
+            if not accounts:
+                return AccountState(equity=0.0, balance=0.0, currency="RUB", margin_used=0.0, broker=self.name)
 
+            # P0: берём первый аккаунт
+            account_id = accounts[0].get("id") or accounts[0].get("accountId")
+            if not account_id:
+                return AccountState(equity=0.0, balance=0.0, currency="RUB", margin_used=0.0, broker=self.name)
+
+            pf = self._get_portfolio_sync(account_id)
+            total = self._q_to_float(pf.get("totalAmountPortfolio", {}))
+            cash = self._q_to_float(pf.get("totalAmountCurrencies", {}))
+
+            # Валюта у total/cash может быть в других полях, но для P0 фиксируем RUB
+            return AccountState(equity=total, balance=cash, currency="RUB", margin_used=0.0, broker=self.name)
+
+        return await asyncio.to_thread(_sync)
+    
     async def list_open_positions(self) -> List[Position]:
-        raise NotImplementedError(
-            "TinkoffV2Broker.list_open_positions is not implemented yet."
-        )
+        def _sync():
+            accounts = self._get_accounts_sync()
+            if not accounts:
+                return []
+
+            account_id = accounts[0].get("id") or accounts[0].get("accountId")
+            if not account_id:
+                return []
+
+            pf = self._get_portfolio_sync(account_id)
+            raw_pos = pf.get("positions", []) or []
+
+            result: list[Position] = []
+            for p in raw_pos:
+                figi = p.get("figi")
+                qty = self._q_to_float(p.get("quantity", {}))
+                avg = self._q_to_float(p.get("averagePositionPrice", {}))
+
+                if qty == 0:
+                    continue
+
+                # P0.5+: унифицируем symbol как тикер через Config.TINKOFF_FIGI_MAP
+                symbol = self._resolve_ticker(figi or "")
+                result.append(
+                    Position(
+                        symbol=symbol,
+                        quantity=qty,
+                        avg_price=avg,
+                        unrealized_pnl=None,
+                        broker=self.name,
+                    )
+                )
+            return result
+
+        return await asyncio.to_thread(_sync)
 
     async def place_order(self, order: OrderRequest) -> OrderResult:
-        raise NotImplementedError(
-            "TinkoffV2Broker.place_order is not implemented yet."
-        )
+        def _sync():
+            accounts = self._get_accounts_sync()
+            if not accounts:
+                raise RuntimeError("TinkoffV2Broker: no accounts available")
+
+            account_id = accounts[0].get("id") or accounts[0].get("accountId")
+            if not account_id:
+                raise RuntimeError("TinkoffV2Broker: accountId missing")
+
+            # symbol ожидаем как тикер → FIGI
+            figi = self._resolve_figi(order.symbol)
+
+            url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.OrdersService/PostOrder"
+            direction = "ORDER_DIRECTION_BUY" if order.side == "buy" else "ORDER_DIRECTION_SELL"
+            order_type = "ORDER_TYPE_MARKET" if order.order_type == "market" else "ORDER_TYPE_LIMIT"
+
+            payload = {
+                "accountId": account_id,
+                "figi": figi,
+                "quantity": int(round(float(order.quantity))),  # P0: лотность грубо
+                "direction": direction,
+                "orderType": order_type,
+                "orderId": order.client_id or f"bot-{int(time.time()*1000)}",
+            }
+
+            # limit price, если нужен
+            if order.order_type == "limit":
+                # price -> quotation
+                pr = float(order.price or 0.0)
+                units = int(pr)
+                nano = int(round((pr - units) * 1e9))
+                payload["price"] = {"units": str(units), "nano": nano}
+
+            resp = self._post_with_backoff(url, payload=payload, timeout=10, is_history=False)
+            data = resp.json() or {}
+
+            oid = data.get("orderId") or payload["orderId"]
+            exec_price = self._q_to_float(data.get("executedOrderPrice", {})) or float(order.price or 0.0)
+
+            return OrderResult(
+                order_id=str(oid),
+                symbol=order.symbol,
+                side=order.side,
+                quantity=float(order.quantity),
+                price=float(exec_price),
+                status="filled",  # P0: считаем market как filled
+                broker=self.name,
+            )
+
+        return await asyncio.to_thread(_sync)
 
     async def cancel_order(self, order_id: str) -> None:
-        raise NotImplementedError(
-            "TinkoffV2Broker.cancel_order is not implemented yet."
-        )
+        def _sync():
+            accounts = self._get_accounts_sync()
+            if not accounts:
+                return
+            account_id = accounts[0].get("id") or accounts[0].get("accountId")
+            if not account_id:
+                return
+
+            url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.OrdersService/CancelOrder"
+            payload = {"accountId": account_id, "orderId": order_id}
+            self._post_with_backoff(url, payload=payload, timeout=10, is_history=False)
+
+        await asyncio.to_thread(_sync)
 
     async def get_open_orders(self, symbol: str) -> List[OrderResult]:
-        raise NotImplementedError(
-            "TinkoffV2Broker.get_open_orders is not implemented yet."
-        )
+        def _sync():
+            accounts = self._get_accounts_sync()
+            if not accounts:
+                return []
+            account_id = accounts[0].get("id") or accounts[0].get("accountId")
+            if not account_id:
+                return []
+
+            url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.OrdersService/GetOrders"
+            payload = {"accountId": account_id}
+            resp = self._post_with_backoff(url, payload=payload, timeout=10, is_history=False)
+            raw = resp.json() or {}
+            orders = raw.get("orders", []) or []
+
+            result: list[OrderResult] = []
+            for o in orders:
+                result.append(
+                    OrderResult(
+                        order_id=str(o.get("orderId", "")),
+                        symbol=symbol,
+                        side="buy" if o.get("direction") == "ORDER_DIRECTION_BUY" else "sell",
+                        quantity=float(o.get("lotsRequested", 0) or 0),
+                        price=self._q_to_float(o.get("initialSecurityPrice", {})),
+                        status=str(o.get("executionReportStatus", "new")),
+                        broker=self.name,
+                    )
+                )
+            return result
+
+        return await asyncio.to_thread(_sync)

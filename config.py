@@ -2,8 +2,14 @@
 from enum import Enum
 from dotenv import load_dotenv
 import os, json
+from enum import Enum
 
 load_dotenv()
+
+class ExecutionMode(str, Enum):
+    BACKTEST = "backtest"
+    PAPER = "paper"
+    LIVE = "live"
 
 class UniverseMode(str, Enum):
     CRYPTO = "crypto"
@@ -90,23 +96,78 @@ class Config:
     # --- ПУТИ ---
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     DATA_DIR = os.path.join(BASE_DIR, "data_cache")
+    RUNTIME_SETTINGS_FILE = os.path.join(BASE_DIR, "runtime_settings.json")
+    _runtime_overrides: dict = {}
+
+    @classmethod
+    def load_runtime_overrides(cls) -> None:
+        if not os.path.exists(cls.RUNTIME_SETTINGS_FILE):
+            return
+        try:
+            with open(cls.RUNTIME_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+            if isinstance(data, dict):
+                cls._runtime_overrides = data
+                for k, v in data.items():
+                    if hasattr(cls, k):
+                        setattr(cls, k, v)
+        except Exception:
+            return
+
+        # guard на live
+        try:
+            mode = getattr(cls, "EXECUTION_MODE", ExecutionMode.BACKTEST)
+            mode_val = mode.value if isinstance(mode, ExecutionMode) else str(mode).lower()
+            if mode_val == "live" and not bool(getattr(cls, "ALLOW_LIVE", False)):
+                cls.EXECUTION_MODE = ExecutionMode.PAPER
+                cls._runtime_overrides["EXECUTION_MODE"] = ExecutionMode.PAPER.value
+        except Exception:
+            pass
+
+    @classmethod
+    def set_runtime(cls, key: str, value, persist: bool = True) -> None:
+        setattr(cls, key, value)
+        cls._runtime_overrides[key] = value.value if hasattr(value, "value") else value
+
+        # guard на live
+        if key == "EXECUTION_MODE":
+            mode_val = value.value if hasattr(value, "value") else str(value).lower()
+            if mode_val == "live" and not bool(getattr(cls, "ALLOW_LIVE", False)):
+                cls.EXECUTION_MODE = ExecutionMode.PAPER
+                cls._runtime_overrides["EXECUTION_MODE"] = ExecutionMode.PAPER.value
+
+        if persist:
+            with open(cls.RUNTIME_SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(cls._runtime_overrides, f, ensure_ascii=False, indent=2)
     MODEL_DIR = "models_checkpoints"
     STRATEGY_FILE = "best_strategy_params.json"
     # --- РЕЖИМ ИСПОЛНЕНИЯ ---
     # Можно переключать через переменную окружения EXECUTION_MODE:
     #   backtest / paper / live
     try:
-        EXECUTION_MODE = ExecutionMode(
-            os.getenv("EXECUTION_MODE", "backtest").lower()
-        )
+        # --- стало ---
+        # Флаг-разрешение для LIVE: по умолчанию запрещён
+        ALLOW_LIVE = os.getenv("ALLOW_LIVE", "0") == "1"
+
+        requested_mode = os.getenv("EXECUTION_MODE", "backtest").lower()
+
+        if requested_mode == "live" and not ALLOW_LIVE:
+            # Если кто-то просит LIVE, но ALLOW_LIVE не поднят,
+            # насильно откатываемся в PAPER.
+            EXECUTION_MODE = ExecutionMode.PAPER
+        else:
+            try:
+                EXECUTION_MODE = ExecutionMode(requested_mode)
+            except ValueError:
+                EXECUTION_MODE = ExecutionMode.BACKTEST
     except ValueError:
         # На случай опечатки в переменной окружения
         EXECUTION_MODE = ExecutionMode.BACKTEST
 
-    # --- Лидеры рынка ---
-    # Для обратной совместимости оставляем LEADER_SYMBOL как "дефолт" (BTC)
-    LEADER_SYMBOL_CRYPTO = "BTCUSDT"
-    LEADER_SYMBOL_EQUITY = "MOEX"   # <-- сюда поставишь тикер индекса МОЕХ
+    # --- Лидеры рынка (дефолты) ---
+    LEADER_SYMBOL_CRYPTO = os.getenv("LEADER_SYMBOL_CRYPTO", "BTCUSDT")
+    LEADER_SYMBOL_EQUITY = os.getenv("LEADER_SYMBOL_EQUITY", "MOEX")
+    # Для обратной совместимости:
     LEADER_SYMBOL = LEADER_SYMBOL_CRYPTO
 
 
@@ -133,7 +194,8 @@ class Config:
     # --- MONEY MANAGEMENT ---
     DEPOSIT = 1000          
     RISK_PER_TRADE = 0.02   
-    MAX_OPEN_POSITIONS = 4  
+    MAX_OPEN_POSITIONS = 5  
+    MAX_POSITION_NOTIONAL = 500.0    # например, 500$ на один инструмент
     
     # --- КОМИССИИ ---
     COMMISSION = 0.00075      
@@ -396,6 +458,11 @@ class Config:
     USE_TG_CRYPTO = os.getenv("USE_TG_CRYPTO", "1") == "1"
     USE_TG_STOCKS = os.getenv("USE_TG_STOCKS", "1") == "1"
 
+    # --- Flags: enable / disable market leaders per asset class ---
+    # Тоже читаются из ENV / .env. По умолчанию включены.
+    USE_LEADER_CRYPTO = os.getenv("USE_LEADER_CRYPTO", "1") == "1"
+    USE_LEADER_STOCKS = os.getenv("USE_LEADER_STOCKS", "1") == "1"
+
     @classmethod
     def equity_symbols(cls) -> list[str]:
         return cls.EQUITY_UNIVERSE
@@ -403,14 +470,26 @@ class Config:
     @classmethod
     def get_leader_for_symbol(cls, symbol: str) -> str:
         """
-        Выбирает лидера в зависимости от класса актива.
+        Возвращает тикер индекса-лидера для данного символа.
+        Может вернуть пустую строку, если лидер для класса актива выключен.
         """
-        if symbol in cls.crypto_symbols():
-            return cls.LEADER_SYMBOL_CRYPTO
-        if symbol in cls.equity_symbols():
-            return cls.LEADER_SYMBOL_EQUITY
-        # Fallback: считаем всё остальное криптой/общим рынком
-        return cls.LEADER_SYMBOL_CRYPTO
+        crypto_set = set(cls.crypto_symbols())
+        equity_set = set(cls.equity_symbols())
+
+        # --- Крипта ---
+        if symbol in crypto_set:
+            if not getattr(cls, "USE_LEADER_CRYPTO", True):
+                return ""  # лидер выключен → без лидера
+            return getattr(cls, "LEADER_SYMBOL_CRYPTO", "BTCUSDT")
+
+        # --- Акции / фьючи Мосбиржи ---
+        if symbol in equity_set:
+            if not getattr(cls, "USE_LEADER_STOCKS", True):
+                return ""  # лидер выключен
+            return getattr(cls, "LEADER_SYMBOL_EQUITY", "MOEX")
+
+        # --- Fallback: без лидера ---
+        return ""
 
     @classmethod
     def get_strategy_params(cls):
@@ -423,3 +502,4 @@ class Config:
                     return params
             except: pass
         return cls.DEFAULT_STRATEGY.copy()
+    

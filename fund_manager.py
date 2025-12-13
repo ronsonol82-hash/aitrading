@@ -2,19 +2,26 @@
 import sys
 import os
 import json
+import asyncio
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
+import threading
 from datetime import datetime, timedelta
 
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
+    QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
     QWidget, QLabel, QComboBox, QGroupBox, QTabWidget, QPushButton,
     QTextEdit, QSplitter, QDoubleSpinBox, QGridLayout, QFrame, QSlider,
-    QTableWidget, QHeaderView, QTableWidgetItem, QRadioButton, QCheckBox
+    QTableWidget, QHeaderView, QTableWidgetItem, QRadioButton, QCheckBox,
+    QTableView,                    # <-- добавили
 )
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QObject, QTimer
-from PyQt5.QtGui import QPainter, QPicture, QColor, QFont
+from PyQt5.QtGui import (
+    QPainter, QPicture, QColor, QFont,
+    QStandardItemModel, QStandardItem   # <-- добавили
+)
+from async_strategy_runner import AsyncStrategyRunner
 
 # --- ИМПОРТЫ ЛОГИКИ ПРОЕКТА ---
 from config import Config, UniverseMode, get_assets_for_universe
@@ -129,10 +136,10 @@ class UtilityWorker(QThread):
         self.args = args
 
     def run(self):
-        print(f"\n[SYSTEM] Executing: {self.script_name} {' '.join(self.args)}...")
+        print(f"\n[SYSTEM] Executing: {self.script_name} {' '.join(self.args)}.")
         try:
             import subprocess
-            from config import Config, UniverseMode  # <- ДОБАВИЛИ
+            from config import Config, UniverseMode
 
             python_exe = sys.executable 
             env = os.environ.copy()
@@ -146,7 +153,11 @@ class UtilityWorker(QThread):
                     print(f"[SYSTEM] Passing UNIVERSE_MODE={mode_obj.value} to child process")
             except Exception:
                 pass
-            
+
+            # 🔁 Прокидываем флаги использования лидеров
+            env["USE_LEADER_CRYPTO"] = "1" if getattr(Config, "USE_LEADER_CRYPTO", True) else "0"
+            env["USE_LEADER_STOCKS"] = "1" if getattr(Config, "USE_LEADER_STOCKS", True) else "0"
+
             cmd = [python_exe, "-u", self.script_name] + self.args
             
             process = subprocess.Popen(
@@ -172,17 +183,28 @@ class BacktestLoader(QThread):
     data_loaded = pyqtSignal(dict)
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, assets, leader):
+    def __init__(self, assets):
         super().__init__()
         self.assets = assets
-        self.leader = leader
 
     def run(self):
         end = datetime.now()
         start = end - timedelta(days=90)
-        print("[DATA] Loading Portfolio Data...")
+        print("[DATA] Loading Portfolio Data.")
         try:
-            portfolio = DataLoader.get_portfolio_data(self.assets, self.leader, start, end, "15m", "1h")
+            # Строим ту же карту лидеров, что и в SignalFactory / Universal
+            leader_map = {
+                sym: Config.get_leader_for_symbol(sym)
+                for sym in self.assets
+            }
+            portfolio = DataLoader.get_portfolio_data(
+                self.assets,
+                leader_map,
+                start,
+                end,
+                "15m",
+                "1h",
+            )
             if not portfolio:
                 self.error_occurred.emit("No data returned from DataLoader.")
                 return
@@ -312,6 +334,7 @@ class FundManagerWindow(QMainWindow):
 
         # 🔌 ExecutionRouter: единая точка входа к Bitget/Tinkoff/Simulated
         self.execution_router = ExecutionRouter()
+        self._router_initialized = False  # --- NEW: флаг инициализации брокеров
 
         # 🕒 Таймер для LIVE MONITOR + история equity за сессию
         self.live_timer = QTimer(self)
@@ -320,7 +343,17 @@ class FundManagerWindow(QMainWindow):
         self.live_equity_history = []  # (t_index, equity)
 
         # Флаг активной торговой сессии
+                # --- LIVE TRADING STATE ---
         self.trading_session_active = False
+        self.live_trader = None              # AsyncStrategyRunner
+        self.live_trader_task = None         # asyncio.Task (в отдельном event loop)
+
+        # --- Async event loop в отдельном потоке ---
+        self._async_loop = asyncio.new_event_loop()
+        self._async_thread = threading.Thread(
+            target=self._run_async_loop, daemon=True
+        )
+        self._async_thread.start()
 
         # Текущий выбранный юниверс (крипта/биржа/оба)
         self.current_universe_mode = Config.UNIVERSE_MODE
@@ -346,6 +379,27 @@ class FundManagerWindow(QMainWindow):
 
         # Синхронизируем режим исполнения при старте
         self.sync_execution_mode_from_config()
+
+    # --- NEW: helper для вызова async-методов из GUI ---
+
+    def _run_async_loop(self):
+        """
+        Фоновый поток: крутит asyncio-цикл для ExecutionRouter и AsyncStrategyRunner.
+        """
+        asyncio.set_event_loop(self._async_loop)
+        self._async_loop.run_forever()
+
+    def _await_async(self, coro):
+        """
+        Запускает async-код из Qt-GUI через существующий event loop
+        в фоне. Блокирует текущий поток, пока корутина не выполнится.
+        """
+        if not hasattr(self, "_async_loop") or self._async_loop is None:
+            # Фолбэк, если вдруг loop ещё не поднят
+            return asyncio.run(coro)
+
+        future = asyncio.run_coroutine_threadsafe(coro, self._async_loop)
+        return future.result()
         
     def setup_ui(self):
         central_widget = QWidget()
@@ -489,6 +543,56 @@ class FundManagerWindow(QMainWindow):
         settings_layout.addWidget(self.chk_tg_crypto)
         settings_layout.addWidget(self.chk_tg_stocks)
 
+        # --- NEW: MARKET LEADERS (флаги + выбор тикера) ---
+        leader_group = QGroupBox("MARKET LEADERS")
+        leader_layout = QGridLayout(leader_group)
+
+        # Флаги "использовать лидера"
+        self.chk_leader_crypto = QCheckBox("Use leader for Crypto")
+        self.chk_leader_stocks = QCheckBox("Use leader for Stocks")
+
+        use_leader_crypto = getattr(
+            Config, "USE_LEADER_CRYPTO", os.getenv("USE_LEADER_CRYPTO", "1") == "1"
+        )
+        use_leader_stocks = getattr(
+            Config, "USE_LEADER_STOCKS", os.getenv("USE_LEADER_STOCKS", "1") == "1"
+        )
+
+        self.chk_leader_crypto.setChecked(bool(use_leader_crypto))
+        self.chk_leader_stocks.setChecked(bool(use_leader_stocks))
+
+        # Выбор лидера для крипты
+        self.cbo_leader_crypto = QComboBox()
+        self.cbo_leader_crypto.addItems(["BTCUSDT", "ETHUSDT", "NONE"])
+        current_crypto_leader = getattr(Config, "LEADER_SYMBOL_CRYPTO", "BTCUSDT")
+        if current_crypto_leader not in ("BTCUSDT", "ETHUSDT"):
+            # если что-то экзотическое — по умолчанию BTC
+            current_crypto_leader = "BTCUSDT"
+        if not use_leader_crypto:
+            current_crypto_leader = "NONE"
+        self.cbo_leader_crypto.setCurrentText(current_crypto_leader)
+
+        # Выбор лидера для акций
+        self.cbo_leader_stocks = QComboBox()
+        self.cbo_leader_stocks.addItems(["MOEX", "RTS", "SBER", "NONE"])
+        current_stock_leader = getattr(Config, "LEADER_SYMBOL_EQUITY", "MOEX")
+        if current_stock_leader not in ("MOEX", "RTS", "SBER"):
+            current_stock_leader = "MOEX"
+        if not use_leader_stocks:
+            current_stock_leader = "NONE"
+        self.cbo_leader_stocks.setCurrentText(current_stock_leader)
+
+        # Разворачиваем в сетку
+        leader_layout.addWidget(QLabel("Crypto leader:"), 0, 0)
+        leader_layout.addWidget(self.chk_leader_crypto, 0, 1)
+        leader_layout.addWidget(self.cbo_leader_crypto, 0, 2)
+
+        leader_layout.addWidget(QLabel("Stocks leader:"), 1, 0)
+        leader_layout.addWidget(self.chk_leader_stocks, 1, 1)
+        leader_layout.addWidget(self.cbo_leader_stocks, 1, 2)
+
+        settings_layout.addWidget(leader_group)
+
         # --- NEW: WFO SLIDERS (TRAIN / TRADE WINDOWS) ---
         self.wfo_widget = WFOSettingsWidget()
         settings_layout.addWidget(self.wfo_widget)
@@ -520,6 +624,9 @@ class FundManagerWindow(QMainWindow):
         btn_feat  = QPushButton("Feature Lab");     btn_feat.setObjectName("DiagBtn")
         btn_plot  = QPushButton("Plot");            btn_plot.setObjectName("DiagBtn")
         btn_validation = QPushButton("Valid Rep");  btn_validation.setObjectName("DiagBtn")
+        btn_full_cycle = QPushButton("Full Cycle Test");    btn_full_cycle.setObjectName("DiagBtn")
+        btn_async_bg   = QPushButton("Async Bitget");       btn_async_bg.setObjectName("DiagBtn")
+        btn_no_look    = QPushButton("Core No-Lookahead"); btn_no_look.setObjectName("DiagBtn")
 
         # 🔹 Новые кнопки для Debug Replay
         btn_debug = QPushButton("Debug Replay (no plots)")
@@ -562,7 +669,15 @@ class FundManagerWindow(QMainWindow):
         btn_debug_plots.clicked.connect(
             lambda: self.run_script("debug_replayer.py", ["--plot"])
         )
-            
+        btn_full_cycle.clicked.connect(
+            lambda: self.run_script("test_full_cycle.py", [])
+        )
+        btn_async_bg.clicked.connect(
+            lambda: self.run_script("test_async_bitget.py", [])
+        )
+        btn_no_look.clicked.connect(
+            lambda: self.run_script("test_core_no_lookahead.py", [])
+        )
         # Расставляем сеткой 4x4
         diag_layout.addWidget(btn_gpu,   0, 0)
         diag_layout.addWidget(btn_leak,  0, 1)
@@ -583,7 +698,10 @@ class FundManagerWindow(QMainWindow):
         # Четвёртый ряд – инфраструктурные проверки
         diag_layout.addWidget(btn_get_instruments, 3, 0)
         diag_layout.addWidget(btn_test_conn,       3, 1)
-
+        # 4-й ряд – high-level тесты
+        diag_layout.addWidget(btn_full_cycle, 3, 2)
+        diag_layout.addWidget(btn_async_bg,   3, 3)
+        diag_layout.addWidget(btn_no_look,    4, 0)
 
         # 2. EXECUTION MODE & TRADING CONTROL
         mode_group = QGroupBox("EXECUTION MODE & TRADING CONTROL")
@@ -1142,36 +1260,99 @@ class FundManagerWindow(QMainWindow):
         LIVE MONITOR v1:
         - Каркас для real-time мониторинга счёта и ордеров.
         - Пока работает как placeholder (DISCONNECTED).
-        """
+        """        
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(15)
 
-        # 1) ACCOUNT OVERVIEW
+        # --- Верхняя строка статуса ---
+        self.lbl_live_status = QLabel("LIVE MONITOR v1 — DISCONNECTED")
+        self.lbl_live_status.setObjectName("LiveStatusLabel")
+        layout.addWidget(self.lbl_live_status)
+
+        # 1) ACCOUNT OVERVIEW - новая версия с GridLayout
         account_group = QGroupBox("ACCOUNT OVERVIEW (LIVE)")
-        acc_layout = QHBoxLayout(account_group)
+        info_grid = QGridLayout(account_group)
+        
+        # Первая строка
+        self.lbl_live_equity = QLabel("Total Equity: —")
+        self.lbl_live_pnl = QLabel("Total PnL: —")
+        info_grid.addWidget(self.lbl_live_equity, 0, 0)
+        info_grid.addWidget(self.lbl_live_pnl, 0, 1)
+        
+        # Вторая строка
+        self.lbl_live_bitget = QLabel("Bitget: —")
+        self.lbl_live_tinkoff = QLabel("Tinkoff: —")
+        info_grid.addWidget(self.lbl_live_bitget, 1, 0)
+        info_grid.addWidget(self.lbl_live_tinkoff, 1, 1)
 
-        self.lbl_live_exchange = QLabel("Brokers: DISCONNECTED")
-        self.lbl_live_equity   = QLabel("Equity: N/A")
-        self.lbl_live_free     = QLabel("Balance: N/A")
-        self.lbl_live_used     = QLabel("Used Margin: N/A")
-
-        acc_layout.addWidget(self.lbl_live_exchange)
-        acc_layout.addWidget(self.lbl_live_equity)
-        acc_layout.addWidget(self.lbl_live_free)
-        acc_layout.addWidget(self.lbl_live_used)
-
-        # Кнопка ручного обновления
+        # Кнопка ручного обновления (оригинальная)
         btn_refresh_live = QPushButton("REFRESH NOW")
         btn_refresh_live.setObjectName("DiagBtn")
         btn_refresh_live.clicked.connect(self.refresh_live_monitor_snapshot)
-        acc_layout.addWidget(btn_refresh_live)
+        info_grid.addWidget(btn_refresh_live, 0, 2, 2, 1)  # Занимает 2 строки
 
-        acc_layout.addStretch()
         layout.addWidget(account_group)
 
-        # 1b) EQUITY CURVE (SESSION)
+        # 1c) RISK CONTROL
+        risk_group = QGroupBox("RISK CONTROL (LIVE/PAPER)")
+        risk_grid = QGridLayout(risk_group)
+
+        self.chk_allow_live = QCheckBox("ALLOW_LIVE (arm real trading)")
+        self.spin_risk = QDoubleSpinBox(); self.spin_risk.setRange(0.0001, 0.10); self.spin_risk.setSingleStep(0.001)
+        self.spin_max_pos = QDoubleSpinBox(); self.spin_max_pos.setRange(1, 200); self.spin_max_pos.setDecimals(0)
+        self.spin_max_notional = QDoubleSpinBox(); self.spin_max_notional.setRange(0, 1e9); self.spin_max_notional.setDecimals(2)
+        self.spin_max_dd = QDoubleSpinBox(); self.spin_max_dd.setRange(0.0, 0.99); self.spin_max_dd.setSingleStep(0.005)
+
+        btn_apply_risk = QPushButton("APPLY & SAVE")
+        btn_apply_risk.setObjectName("ActionBtn")
+
+        risk_grid.addWidget(self.chk_allow_live, 0, 0, 1, 2)
+
+        risk_grid.addWidget(QLabel("RISK_PER_TRADE"), 1, 0)
+        risk_grid.addWidget(self.spin_risk,           1, 1)
+
+        risk_grid.addWidget(QLabel("MAX_OPEN_POSITIONS"), 2, 0)
+        risk_grid.addWidget(self.spin_max_pos,            2, 1)
+
+        risk_grid.addWidget(QLabel("MAX_POSITION_NOTIONAL"), 3, 0)
+        risk_grid.addWidget(self.spin_max_notional,           3, 1)
+
+        risk_grid.addWidget(QLabel("MAX_DAILY_DRAWDOWN"), 4, 0)
+        risk_grid.addWidget(self.spin_max_dd,            4, 1)
+
+        risk_grid.addWidget(btn_apply_risk, 5, 0, 1, 2)
+
+        layout.addWidget(risk_group)
+
+        def _load_risk_ui_from_config():
+            self.chk_allow_live.setChecked(bool(getattr(Config, "ALLOW_LIVE", False)))
+            self.spin_risk.setValue(float(getattr(Config, "RISK_PER_TRADE", 0.02)))
+            self.spin_max_pos.setValue(float(getattr(Config, "MAX_OPEN_POSITIONS", 5)))
+            self.spin_max_notional.setValue(float(getattr(Config, "MAX_POSITION_NOTIONAL", 0.0)))
+            self.spin_max_dd.setValue(float(getattr(Config, "MAX_DAILY_DRAWDOWN", 0.05)))
+
+        def _apply_risk_ui_to_config():
+            from config import ExecutionMode
+
+            Config.set_runtime("ALLOW_LIVE", bool(self.chk_allow_live.isChecked()))
+            Config.set_runtime("RISK_PER_TRADE", float(self.spin_risk.value()))
+            Config.set_runtime("MAX_OPEN_POSITIONS", int(self.spin_max_pos.value()))
+            Config.set_runtime("MAX_POSITION_NOTIONAL", float(self.spin_max_notional.value()))
+            Config.set_runtime("MAX_DAILY_DRAWDOWN", float(self.spin_max_dd.value()))
+
+            # если режим LIVE выбран, а ALLOW_LIVE снят — guard откатит
+            # обновим UI режима, чтобы пользователь сразу увидел правду
+            self.sync_execution_mode_from_config()
+
+            if hasattr(self, "live_log"):
+                self.live_log.append("[RISK] Settings applied & saved to runtime_settings.json")
+
+        btn_apply_risk.clicked.connect(_apply_risk_ui_to_config)
+        _load_risk_ui_from_config()
+
+        # 1b) EQUITY CURVE (SESSION) - оригинальный график
         equity_group = QGroupBox("EQUITY CURVE (SESSION)")
         eq_layout = QVBoxLayout(equity_group)
 
@@ -1182,23 +1363,31 @@ class FundManagerWindow(QMainWindow):
 
         layout.addWidget(equity_group, stretch=1)
 
-        # 2) POSITIONS & ORDERS
+        # 2) POSITIONS & ORDERS - с новой таблицей позиций
         tables_container = QWidget()
         tables_layout = QHBoxLayout(tables_container)
         tables_layout.setContentsMargins(0, 0, 0, 0)
         tables_layout.setSpacing(10)
 
-        # Positions table
-        self.tbl_positions = QTableWidget()
-        self.tbl_positions.setColumnCount(8)
-        self.tbl_positions.setHorizontalHeaderLabels([
-            "Symbol", "Dir", "Size", "Entry", "SL", "TP", "UPNL", "UPNL%"
+        # Новая таблица позиций с QTableView
+        positions_group = QGroupBox("POSITIONS (LIVE)")
+        pos_layout = QVBoxLayout(positions_group)
+        
+        self.tbl_live_positions = QTableView()
+        self.model_live_positions = QStandardItemModel()
+        self.model_live_positions.setHorizontalHeaderLabels([
+            "Broker", "Symbol", "Side", "Qty", "Avg Price",
+            "Last Price", "PnL", "PnL %"
         ])
-        self.tbl_positions.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.tbl_positions.setSelectionBehavior(self.tbl_positions.SelectRows)
-        self.tbl_positions.setEditTriggers(self.tbl_positions.NoEditTriggers)
+        self.tbl_live_positions.setModel(self.model_live_positions)
+        pos_layout.addWidget(self.tbl_live_positions)
+        
+        tables_layout.addWidget(positions_group)
 
-        # Orders table
+        # Оригинальная таблица ордеров (оставляем как было)
+        orders_group = QGroupBox("ORDERS (LIVE)")
+        ord_layout = QVBoxLayout(orders_group)
+        
         self.tbl_orders = QTableWidget()
         self.tbl_orders.setColumnCount(7)
         self.tbl_orders.setHorizontalHeaderLabels([
@@ -1207,13 +1396,13 @@ class FundManagerWindow(QMainWindow):
         self.tbl_orders.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.tbl_orders.setSelectionBehavior(self.tbl_orders.SelectRows)
         self.tbl_orders.setEditTriggers(self.tbl_orders.NoEditTriggers)
-
-        tables_layout.addWidget(self.tbl_positions)
-        tables_layout.addWidget(self.tbl_orders)
+        ord_layout.addWidget(self.tbl_orders)
+        
+        tables_layout.addWidget(orders_group)
 
         layout.addWidget(tables_container, stretch=2)
 
-        # 3) LIVE EVENT LOG
+        # 3) LIVE EVENT LOG - оригинальный лог
         live_log_group = QGroupBox("LIVE EVENTS")
         log_layout = QVBoxLayout(live_log_group)
 
@@ -1222,8 +1411,6 @@ class FundManagerWindow(QMainWindow):
         log_layout.addWidget(self.live_log)
 
         layout.addWidget(live_log_group, stretch=1)
-
-        layout.addStretch()
 
         # Первичная инициализация
         self.refresh_live_monitor_snapshot()
@@ -1292,11 +1479,44 @@ class FundManagerWindow(QMainWindow):
         except Exception as e:
             print(f"❌ Save Error: {e}")
 
-        # 7) Обновляем ENV для Telegram HTF...
+        # 7) Обновляем ENV для Telegram HTF.
         if hasattr(self, "chk_tg_crypto"):
             os.environ["USE_TG_CRYPTO"] = "1" if self.chk_tg_crypto.isChecked() else "0"
         if hasattr(self, "chk_tg_stocks"):
             os.environ["USE_TG_STOCKS"] = "1" if self.chk_tg_stocks.isChecked() else "0"
+
+        # 8) Обновляем ENV + Config для лидеров рынка.
+        if hasattr(self, "chk_leader_crypto") and hasattr(self, "cbo_leader_crypto"):
+            use_leader_crypto = self.chk_leader_crypto.isChecked()
+            use_leader_stocks = self.chk_leader_stocks.isChecked()
+
+            sym_leader_crypto = self.cbo_leader_crypto.currentText().strip()
+            sym_leader_stocks = self.cbo_leader_stocks.currentText().strip()
+
+            # NONE → фактически выключаем лидера
+            if sym_leader_crypto.upper() == "NONE":
+                use_leader_crypto = False
+            if sym_leader_stocks.upper() == "NONE":
+                use_leader_stocks = False
+
+            # Обновляем Config (чтобы текущий процесс видел новые значения)
+            Config.USE_LEADER_CRYPTO = use_leader_crypto
+            Config.USE_LEADER_STOCKS = use_leader_stocks
+            os.environ["USE_LEADER_CRYPTO"] = "1" if use_leader_crypto else "0"
+            os.environ["USE_LEADER_STOCKS"] = "1" if use_leader_stocks else "0"
+
+            if use_leader_crypto and sym_leader_crypto.upper() != "NONE":
+                Config.LEADER_SYMBOL_CRYPTO = sym_leader_crypto
+                os.environ["LEADER_SYMBOL_CRYPTO"] = sym_leader_crypto
+            if use_leader_stocks and sym_leader_stocks.upper() != "NONE":
+                Config.LEADER_SYMBOL_EQUITY = sym_leader_stocks
+                os.environ["LEADER_SYMBOL_EQUITY"] = sym_leader_stocks
+
+            # (опционально) сохраняем в профиль для будущего использования
+            data[profile_key]["use_leader_crypto"] = use_leader_crypto
+            data[profile_key]["use_leader_stocks"] = use_leader_stocks
+            data[profile_key]["leader_symbol_crypto"] = getattr(Config, "LEADER_SYMBOL_CRYPTO", "BTCUSDT")
+            data[profile_key]["leader_symbol_stocks"] = getattr(Config, "LEADER_SYMBOL_EQUITY", "MOEX")
             
 
     def load_optimizer_settings(self):
@@ -1370,59 +1590,158 @@ class FundManagerWindow(QMainWindow):
         self.save_optimizer_settings()
         self.run_script("optimizer.py", ["--mode", "sniper"])
 
-    # --- NEW: хелперы для передачи WFO в скрипты ---
     def refresh_live_monitor_snapshot(self):
         """
         Обновляет LIVE MONITOR, используя ExecutionRouter:
-          - агрегированный equity/balance по всем брокерам;
-          - список открытых позиций;
-          - обновляет equity-кривую за сессию.
+        - агрегированный equity/balance и PnL по брокерам;
+        - список открытых позиций;
+        - обновляет equity-кривую за сессию.
+
+        Все async-вызовы идут через self._async_loop, чтобы не блокировать GUI.
         """
-        # Если роутер по какой-то причине не инициализирован — ведём себя как раньше
-        if not hasattr(self, "execution_router") or self.execution_router is None:
-            self.lbl_live_exchange.setText("Brokers: DISCONNECTED")
-            self.lbl_live_equity.setText("Equity: N/A")
-            self.lbl_live_free.setText("Balance: N/A")
-            self.lbl_live_used.setText("Used Margin: N/A")
-            self.tbl_positions.setRowCount(0)
-            self.tbl_orders.setRowCount(0)
+        import asyncio
+        from config import ExecutionMode
+
+        # 0) Если роутера нет – показываем DISCONNECTED и чистим UI
+        router = getattr(self, "execution_router", None)
+        if router is None:
+            if hasattr(self, "lbl_live_status"):
+                self.lbl_live_status.setText("LIVE MONITOR v1 — DISCONNECTED")
+            if hasattr(self, "lbl_live_equity"):
+                self.lbl_live_equity.setText("Total Equity: —")
+            if hasattr(self, "lbl_live_pnl"):
+                self.lbl_live_pnl.setText("Total PnL: —")
+            if hasattr(self, "lbl_live_bitget"):
+                self.lbl_live_bitget.setText("Bitget: —")
+            if hasattr(self, "lbl_live_tinkoff"):
+                self.lbl_live_tinkoff.setText("Tinkoff: —")
+            if hasattr(self, "model_live_positions"):
+                self.model_live_positions.removeRows(
+                    0, self.model_live_positions.rowCount()
+                )
+            if hasattr(self, "tbl_orders"):
+                self.tbl_orders.setRowCount(0)
             if hasattr(self, "live_equity_plot"):
                 self.live_equity_plot.clear()
             return
 
-        # --- 1. Агрегированное состояние счёта ---
+        # 1) В режиме BACKTEST монитор не трогаем
+        mode_obj = getattr(Config, "EXECUTION_MODE", ExecutionMode.BACKTEST)
+        if isinstance(mode_obj, ExecutionMode):
+            mode = mode_obj
+        else:
+            try:
+                mode = ExecutionMode(mode_obj)
+            except Exception:
+                mode = ExecutionMode.BACKTEST
+
+        if mode == ExecutionMode.BACKTEST:
+            return
+
+        # 2) Проверяем event loop
+        loop = getattr(self, "_async_loop", None)
+        if loop is None:
+            return
+
+        # 3) Однократная инициализация брокеров
+        if not getattr(self, "_router_initialized", False):
+            try:
+                fut_init = asyncio.run_coroutine_threadsafe(
+                    router.initialize(),
+                    loop,
+                )
+                fut_init.result(timeout=10.0)
+                self._router_initialized = True
+            except Exception as e:
+                if hasattr(self, "lbl_live_status"):
+                    self.lbl_live_status.setText("LIVE MONITOR v1 — ERROR (init)")
+                if hasattr(self, "live_log"):
+                    self.live_log.append(f"[ERROR] Router init failed: {e}")
+                return
+
+        # 4) Тянем агрегированное состояние счёта
         try:
-            snapshot = self.execution_router.get_global_account_state()
+            fut_state = asyncio.run_coroutine_threadsafe(
+                router.get_global_account_state(),
+                loop,
+            )
+            state = fut_state.result(timeout=5.0)
         except Exception as e:
-            self.lbl_live_exchange.setText("Brokers: ERROR")
-            self.lbl_live_equity.setText("Equity: ERR")
-            self.lbl_live_free.setText("Balance: ERR")
-            self.lbl_live_used.setText("Used Margin: ERR")
-            self.tbl_positions.setRowCount(0)
-            self.tbl_orders.setRowCount(0)
+            if hasattr(self, "lbl_live_status"):
+                self.lbl_live_status.setText("LIVE MONITOR v1 — ERROR (state)")
+            if hasattr(self, "lbl_live_equity"):
+                self.lbl_live_equity.setText("Total Equity: ERR")
+            if hasattr(self, "lbl_live_pnl"):
+                self.lbl_live_pnl.setText("Total PnL: ERR")
+            if hasattr(self, "lbl_live_bitget"):
+                self.lbl_live_bitget.setText("Bitget: ERR")
+            if hasattr(self, "lbl_live_tinkoff"):
+                self.lbl_live_tinkoff.setText("Tinkoff: ERR")
+            if hasattr(self, "model_live_positions"):
+                self.model_live_positions.removeRows(
+                    0, self.model_live_positions.rowCount()
+                )
+            if hasattr(self, "tbl_orders"):
+                self.tbl_orders.setRowCount(0)
             if hasattr(self, "live_log"):
                 self.live_log.append(f"[ERROR] Failed to refresh account snapshot: {e}")
             return
 
-        if snapshot.details:
-            brokers_str = ", ".join(snapshot.details.keys())
-        else:
-            brokers_str = "NO BROKERS"
+        # ---- 4a. Агрегаты по счёту ----
+        total_equity = float(getattr(state, "equity", 0.0) or 0.0)
 
-        self.lbl_live_exchange.setText(f"Brokers: {brokers_str}")
-        self.lbl_live_equity.setText(f"Equity: {snapshot.equity:,.2f}")
-        self.lbl_live_free.setText(f"Balance: {snapshot.balance:,.2f}")
+        total_upnl = 0.0
+        bitget_eq = bitget_upnl = 0.0
+        tink_eq = tink_upnl = 0.0
 
-        total_margin_used = sum(
-            getattr(st, "margin_used", 0.0) for st in snapshot.details.values()
-        )
-        self.lbl_live_used.setText(f"Used Margin: {total_margin_used:,.2f}")
+        details = getattr(state, "details", {}) or {}
 
-        # --- 1b. Обновляем equity-кривую ---
+        for name, st in details.items():
+            eq = float(getattr(st, "equity", 0.0) or 0.0)
+            upnl = float(getattr(st, "unrealized_pnl", 0.0) or 0.0)
+            total_upnl += upnl
+
+            lname = str(name).lower()
+            if lname.startswith("bitget"):
+                bitget_eq += eq
+                bitget_upnl += upnl
+            if lname.startswith("tinkoff"):
+                tink_eq += eq
+                tink_upnl += upnl
+
+        # ---- 4b. Обновляем верхние лейблы ----
+        if hasattr(self, "lbl_live_status"):
+            self.lbl_live_status.setText("LIVE MONITOR v1 — CONNECTED")
+
+        if hasattr(self, "lbl_live_equity"):
+            self.lbl_live_equity.setText(f"Total Equity: {total_equity:,.2f}")
+
+        if hasattr(self, "lbl_live_pnl"):
+            self.lbl_live_pnl.setText(f"Total PnL: {total_upnl:,.2f}")
+
+        if hasattr(self, "lbl_live_bitget"):
+            if bitget_eq > 0.0 or bitget_upnl != 0.0:
+                self.lbl_live_bitget.setText(
+                    f"Bitget: eq={bitget_eq:,.2f}, uPnL={bitget_upnl:,.2f}"
+                )
+            else:
+                self.lbl_live_bitget.setText("Bitget: —")
+
+        if hasattr(self, "lbl_live_tinkoff"):
+            if tink_eq > 0.0 or tink_upnl != 0.0:
+                self.lbl_live_tinkoff.setText(
+                    f"Tinkoff: eq={tink_eq:,.2f}, uPnL={tink_upnl:,.2f}"
+                )
+            else:
+                self.lbl_live_tinkoff.setText("Tinkoff: —")
+
+        # 5) Equity-кривая за сессию
         try:
-            # Используем просто индекс как "время" внутри сессии
+            if not hasattr(self, "live_equity_history"):
+                self.live_equity_history = []
             t_idx = len(self.live_equity_history)
-            self.live_equity_history.append((t_idx, float(snapshot.equity)))
+            self.live_equity_history.append((t_idx, total_equity))
+
             if hasattr(self, "live_equity_plot") and len(self.live_equity_history) >= 2:
                 xs = np.array([t for (t, _) in self.live_equity_history], dtype=float)
                 ys = np.array([v for (_, v) in self.live_equity_history], dtype=float)
@@ -1431,68 +1750,85 @@ class FundManagerWindow(QMainWindow):
         except Exception as e:
             print(f"[LIVE] Failed to update equity curve: {e}")
 
-        # --- 2. Позиции ---
+        # 6) Позиции → POSITIONS (LIVE)
         try:
-            positions = self.execution_router.list_all_positions()
+            fut_pos = asyncio.run_coroutine_threadsafe(
+                router.list_all_positions(),
+                loop,
+            )
+            positions = fut_pos.result(timeout=5.0)
         except Exception as e:
-            self.tbl_positions.setRowCount(0)
+            if hasattr(self, "model_live_positions"):
+                self.model_live_positions.removeRows(
+                    0, self.model_live_positions.rowCount()
+                )
+            if hasattr(self, "tbl_orders"):
+                self.tbl_orders.setRowCount(0)
             if hasattr(self, "live_log"):
                 self.live_log.append(f"[ERROR] Failed to fetch positions: {e}")
             return
 
-        self.tbl_positions.setRowCount(len(positions))
+        if hasattr(self, "model_live_positions"):
+            # очистить таблицу
+            self.model_live_positions.removeRows(
+                0, self.model_live_positions.rowCount()
+            )
 
-        for row_idx, p in enumerate(positions):
-            symbol = getattr(p, "symbol", "")
-            broker = getattr(p, "broker", "")
-            qty = float(getattr(p, "quantity", 0.0) or 0.0)
-            avg_price = float(getattr(p, "avg_price", 0.0) or 0.0)
-            upnl = float(getattr(p, "unrealized_pnl", 0.0) or 0.0)
+            from PyQt5.QtGui import QColor, QStandardItem
 
-            direction = "LONG" if qty > 0 else "SHORT"
-            size_abs = abs(qty)
+            for p in positions or []:
+                symbol = getattr(p, "symbol", "")
+                broker_name = getattr(p, "broker", "")
+                qty = float(getattr(p, "quantity", 0.0) or 0.0)
+                avg_price = float(getattr(p, "avg_price", 0.0) or 0.0)
+                last_price = float(getattr(p, "last_price", avg_price) or 0.0)
+                upnl = float(getattr(p, "unrealized_pnl", 0.0) or 0.0)
 
-            # UPNL% относительно notional (entry * size)
-            if avg_price > 0 and size_abs > 0:
-                try:
-                    upnl_pct = (upnl / (avg_price * size_abs)) * 100.0
-                except ZeroDivisionError:
+                side = "LONG" if qty > 0 else "SHORT"
+                size_abs = abs(qty)
+
+                if avg_price > 0 and size_abs > 0:
+                    try:
+                        upnl_pct = (upnl / (avg_price * size_abs)) * 100.0
+                    except ZeroDivisionError:
+                        upnl_pct = 0.0
+                else:
                     upnl_pct = 0.0
-            else:
-                upnl_pct = 0.0
 
-            sym_label = f"{symbol} ({broker})" if broker else symbol
+                color = None
+                if upnl > 0:
+                    color = QColor("#26a69a")
+                elif upnl < 0:
+                    color = QColor("#ef5350")
 
-            # Цветовая подсветка PnL
-            color = None
-            if upnl > 0:
-                color = QColor("#26a69a")
-            elif upnl < 0:
-                color = QColor("#ef5350")
+                row_values = [
+                    str(broker_name),
+                    str(symbol),
+                    side,
+                    f"{size_abs:.4f}",
+                    f"{avg_price:,.4f}",
+                    f"{last_price:,.4f}",
+                    f"{upnl:,.2f}",
+                    f"{upnl_pct:,.2f}%",
+                ]
 
-            def make_item(text):
-                item = QTableWidgetItem(text)
-                if color is not None:
-                    item.setForeground(color)
-                return item
+                items = [QStandardItem(text) for text in row_values]
+                if color is not None and len(items) >= 8:
+                    # Подсветим PnL и PnL %
+                    items[6].setForeground(color)
+                    items[7].setForeground(color)
 
-            self.tbl_positions.setItem(row_idx, 0, QTableWidgetItem(sym_label))
-            self.tbl_positions.setItem(row_idx, 1, QTableWidgetItem(direction))
-            self.tbl_positions.setItem(row_idx, 2, QTableWidgetItem(f"{size_abs:.4f}"))
-            self.tbl_positions.setItem(row_idx, 3, QTableWidgetItem(f"{avg_price:.4f}"))
-            self.tbl_positions.setItem(row_idx, 4, QTableWidgetItem(""))  # SL
-            self.tbl_positions.setItem(row_idx, 5, QTableWidgetItem(""))  # TP
-            self.tbl_positions.setItem(row_idx, 6, make_item(f"{upnl:,.2f}"))
-            self.tbl_positions.setItem(row_idx, 7, make_item(f"{upnl_pct:.2f}"))
+                self.model_live_positions.appendRow(items)
 
-        # --- 3. Ордеров пока нет (оставляем таблицу пустой) ---
-        self.tbl_orders.setRowCount(0)
+        # 7) Таблица ордеров — пока заглушка
+        if hasattr(self, "tbl_orders"):
+            self.tbl_orders.setRowCount(0)
 
-        # Немного логов, чтобы видеть, что всё живое
+        # 8) Краткий лог-снимок
         if hasattr(self, "live_log"):
             self.live_log.append(
-                f"[SNAPSHOT] Brokers: {brokers_str} | Equity: {snapshot.equity:,.2f} "
-                f"| Positions: {len(positions)}"
+                f"[SNAPSHOT] Equity: {total_equity:,.2f} | uPnL: {total_upnl:,.2f} | "
+                f"Positions: {len(positions) if positions is not None else 0}"
             )
 
     def get_selected_assets(self) -> list[str]:
@@ -1607,24 +1943,76 @@ class FundManagerWindow(QMainWindow):
             self.live_log.append(f"[MODE] Execution mode switched to {enum_val.value}")
 
     def on_start_trading_clicked(self):
+        """
+        Запускает live-цикл AsyncStrategyRunner в отдельном asyncio-loop'е.
+        Разрешено только в режимах PAPER / LIVE.
+        """
+        from config import ExecutionMode
+
+        mode_obj = getattr(Config, "EXECUTION_MODE", ExecutionMode.BACKTEST)
+        mode = mode_obj.value if isinstance(mode_obj, ExecutionMode) else str(mode_obj).lower()
+        mode = mode.lower()
+
+        if mode == "backtest":
+            msg = "[TRADING] EXECUTION_MODE=backtest — live-сессию не запускаем. Переключись на PAPER или LIVE."
+            print(msg)
+            if hasattr(self, "live_log"):
+                self.live_log.append(msg)
+            return
+
         if self.trading_session_active:
             print("[TRADING] Session already active.")
             return
 
         assets = self.get_selected_assets()
+        if not assets:
+            print("[TRADING] No assets selected — abort.")
+            if hasattr(self, "live_log"):
+                self.live_log.append("[TRADING] No assets selected.")
+            return
+
         print(f"[TRADING] Starting session with universe={Config.UNIVERSE_MODE.value}, assets={assets}")
+
+        # Создаем раннер, если его ещё нет
+        if self.live_trader is None:
+            self.live_trader = AsyncStrategyRunner()
+
+        # Обновляем фильтр по активам
+        self.live_trader.set_assets(assets)
+
+        if not hasattr(self, "_async_loop") or self._async_loop is None:
+            print("[TRADING] Async loop is not initialized.")
+            return
+
+        import asyncio
+
+        async def _runner_main():
+            try:
+                await self.live_trader.initialize()
+                await self.live_trader.run_forever()
+            except asyncio.CancelledError:
+                print("[TRADING] Live trader cancelled.")
+            except Exception as e:
+                print(f"[TRADING] Live trader error: {type(e).__name__}: {e}")
+
+        # Запускаем корутину в фоне
+        self.live_trader_task = asyncio.run_coroutine_threadsafe(
+            _runner_main(),
+            self._async_loop,
+        )
 
         self.trading_session_active = True
 
-        # передаём список активов в живой трейдер / роутер
-        if self.live_trader is not None:
-            self.live_trader.set_assets(assets)
-
+        if hasattr(self, "live_log"):
+            self.live_log.append("[TRADING] Session started (AsyncStrategyRunner running).")
         print("[TRADING] Session started.")
 
     def on_stop_trading_clicked(self):
         """
-        Остановка торговой сессии (каркас).
+        Остановка торговой сессии:
+        - просим AsyncStrategyRunner остановиться;
+        - отменяем задачу;
+        - оставляем ExecutionRouter живым (монитор можно крутить дальше).
         """
         if not self.trading_session_active:
             print("[TRADING] No active session.")
@@ -1632,12 +2020,23 @@ class FundManagerWindow(QMainWindow):
                 self.live_log.append("[TRADING] No active session.")
             return
 
+        print("[TRADING] Stopping session...")
+
+        if self.live_trader is not None:
+            try:
+                self.live_trader.request_stop()
+            except AttributeError:
+                pass
+
+        if self.live_trader_task is not None:
+            self.live_trader_task.cancel()
+            self.live_trader_task = None
+
         self.trading_session_active = False
-        print("[TRADING] Session stopped.")
+
         if hasattr(self, "live_log"):
             self.live_log.append("[TRADING] Session stopped.")
-
-        # TODO: сюда же добавим реальный механизм остановки loop'а    
+        print("[TRADING] Session stopped.")
 
     def _build_wfo_cli(self):
         """

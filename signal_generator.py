@@ -11,6 +11,7 @@ from config import Config, UniverseMode
 from data_loader import DataLoader
 from indicators import FeatureEngineer
 from model_engine import MLEngine
+from risk_utils import calc_position_size
 import argparse
 from joblib import Parallel, delayed
 import multiprocessing
@@ -786,26 +787,52 @@ def calculate_signal_strength(row):
 def calculate_position_size(symbol, atr, risk_level):
     """
     СИНХРОННЫЙ расчёт размера позиции на основе ATR и уровня риска.
+    Использует тот же движок, что и боевой риск-менеджмент (calc_position_size).
     """
-    from data_loader import DataLoader
+    from data_loader import DataLoader  # локальный импорт, чтобы избежать циклов
+
+    equity = getattr(Config, "DEPOSIT", 1000.0)
+    sl_mult = Config.DEFAULT_STRATEGY.get("sl", 2.0)
+    max_notional = getattr(Config, "MAX_POSITION_NOTIONAL", None)
 
     try:
         end = datetime.now()
         start = end - timedelta(days=1)
-        data = DataLoader.get_symbol_data(symbol, start, end, '1h')
-        
-        if not data.empty:
-            current_price = data['close'].iloc[-1]
-            atr_value = atr if atr > 0 else data['close'].diff().abs().rolling(14).mean().iloc[-1]
-            atr_distance = atr_value * 2  # стоп на 2 ATR
-            risk_amount = 1000 * risk_level  # риск в деньгах (пока фикс 1000)
-            position_size = risk_amount / atr_distance
-            return min(position_size, 1000)
-    except Exception:
-        pass
-    
-    return 100.0
+        data = DataLoader.get_symbol_data(symbol, start, end, "1h")
 
+        if not data.empty:
+            current_price = float(data["close"].iloc[-1])
+
+            # Если ATR в сигналах не задан или некорректен — пересчитаем грубо.
+            if atr is None or atr <= 0:
+                atr_value = (
+                    data["close"]
+                    .diff()
+                    .abs()
+                    .rolling(14)
+                    .mean()
+                    .iloc[-1]
+                )
+            else:
+                atr_value = float(atr)
+
+            ps = calc_position_size(
+                equity=equity,
+                risk_per_trade=risk_level,
+                atr=atr_value,
+                sl_mult=sl_mult,
+                price=current_price,
+                max_notional=max_notional,
+            )
+
+            if ps.size > 0:
+                return ps.size
+
+    except Exception:
+        # В случае любой ошибки просто возвращаем 0 — не лезем в сделку
+        return 0.0
+
+    return 0.0
 
 def prepare_orders_from_signals(latest_signals: dict, risk_level: float):
     """Подготавливает ордера на основе последних сигналов (синхронно)."""

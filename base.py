@@ -44,10 +44,14 @@ class OrderResult:
 class Position:
     """
     Открытая позиция по инструменту.
+
+    symbol        — человекочитаемый ключ (тикер/пара), используется в стратегии и UI
+    instrument_id — истинный идентификатор инструмента у брокера (например FIGI для Tinkoff)
     """
     symbol: str
-    quantity: float
-    avg_price: float
+    instrument_id: Optional[str] = None  # P0.5++: FIGI для Tinkoff, None для crypto/симулятора
+    quantity: float = 0.0
+    avg_price: float = 0.0
     unrealized_pnl: Optional[float] = None
     broker: Optional[str] = None
 
@@ -154,7 +158,21 @@ class BrokerAPI(ABC):
         В симуляторе на первом этапе может возвращать пустой список.
         """
         ...
+    # --- P0 extensions (optional) ---
 
+    async def close_position(self, symbol: str, reason: str = "") -> None:
+        """
+        Опционально: закрыть позицию по symbol.
+        По умолчанию не реализовано.
+        """
+        raise NotImplementedError(f"{self.__class__.__name__}.close_position not implemented")
+
+    def normalize_qty(self, symbol: str, qty: float, price: float | None = None) -> float:
+        """
+        Опционально: привести количество к шагу/лотности/минимумам.
+        По умолчанию возвращаем как есть.
+        """
+        return float(qty)
 
 # ================================
 # Unified Broker Interface Mixin

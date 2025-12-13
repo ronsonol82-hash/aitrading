@@ -2,7 +2,7 @@
 import asyncio
 import pickle
 from datetime import datetime, timedelta
-from config import Config
+from config import Config, ExecutionMode
 from execution_router import ExecutionRouter
 
 
@@ -39,7 +39,10 @@ async def test_full_cycle():
                     print(f"   {symbol}: p_long={p_long:.3f}, p_short={p_short:.3f}")
                     
                     # 4. Тестовое исполнение (только для симуляционного режима)
-                    if Config.EXECUTION_MODE in ["backtest", "paper"]:
+                    mode_obj = getattr(Config, "EXECUTION_MODE", ExecutionMode.BACKTEST)
+                    mode = mode_obj.value if isinstance(mode_obj, ExecutionMode) else str(mode_obj).lower()
+
+                    if mode in ("backtest", "paper"):
                         # Определяем направление по вероятностям
                         if p_long > 0.6:
                             print(f"   🟢 Сигнал LONG для {symbol} (вероятность: {p_long:.2%})")
